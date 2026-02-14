@@ -10,11 +10,11 @@ Launch `KeyboardJockey.exe`. It minimizes to the system tray immediately. Press 
 
 ### Grid Navigation
 
-Press **Ctrl+Alt+M** to show a full-screen overlay grid (32 columns × 12 rows). Each cell is labeled with a two-letter code (aa, ab, ac, ...). Type the two letters to move the mouse to that cell.
+Press **Ctrl+Alt+M** to show a full-screen overlay grid. Each cell is labeled with a short letter code. Type the letters to move the mouse to that cell, then press **Enter** to click. Hold **Ctrl+Enter** for a right-click.
 
-Each cell also contains a 3×3 sub-grid labeled **a–h** (around the center). After typing a two-letter cell code, type a third letter to move the mouse to a specific sub-position within that cell. This gives you 676 × 8 = **5,408 distinct target points** across your screen.
+If you need further accuracy, each cell also contains a 3×3 sub-grid labeled **a–h** (around the center). After typing a cell code, type one more letter to move the mouse to a specific sub-position within that cell.
 
-Press **Enter** to click at the current mouse position. Hold **Ctrl+Enter** for a right-click.
+If the content is too obscured by the grid, hold down **Shift** to make your desktop more visible.
 
 ### Arrow Key Fine-Tuning
 
@@ -28,7 +28,7 @@ The grid fades to semi-transparent during arrow key movement so you can see what
 
 ### Window Switching (TAB Mode)
 
-Press **Tab** while the grid is showing to cycle through open application windows. Each window is highlighted with a red border and a title label showing its position in the list. Windows are sorted by visible area (most visible first).
+Press **Tab** while the grid is showing to cycle through open application windows. Each window is highlighted with a red border and a title label showing its position in the list. Unlike traditional Windows Alt+Tab behaviour (which cycles through by order of last use), windows are sorted by visible area (most visible first).
 
 - **Tab**: Next window
 - **Shift+Tab**: Previous window
@@ -39,20 +39,18 @@ Press **Tab** while the grid is showing to cycle through open application window
 
 After pressing Tab, you can search for windows by typing part of their title:
 
-- After **2 seconds** of inactivity in TAB mode, or by pressing **\***, all windows (including fully occluded ones) are shown with red highlight boxes
+- After a brief pause in TAB mode, or by pressing **\***, all windows (including fully occluded ones) are shown with red highlight boxes
 - Start **typing** to filter windows by substring match (case-insensitive). For example, typing "out" would match "Outlook", "About", etc.
 - **Enter** activates the highlighted window. If your search narrows to a single match, Enter focuses it immediately
 - **Backspace** removes the last character from the search
-- The search resets after 2 seconds of inactivity, returning to the all-windows view
+- The search resets after a brief pause, returning to the all-windows view
 - **Tab/Shift+Tab** still cycles through the filtered results
 
 ### Cursor Hide & Reveal
 
-Press **Space** while the grid is showing to hide the mouse cursor and dismiss the grid. This is useful when you want an unobstructed view of your screen.
+Keyboard Jockey automatically hides your mouse cursor once you start typing, so it doesn't obscure what you're trying to type. Moving the mouse at any time will bring the cursor back. This is similar to the built-in Windows "Hide pointer while typing" setting, except it works more consistently — for example, in web browsers and Electron-based applications.
 
-- The cursor reappears automatically when you **move the mouse**
-- On reappear, the cursor plays a **shrink animation** (large → normal size over 500ms) so you can easily spot where it is
-- The cursor is also restored instantly (without animation) when you reactivate the grid with Ctrl+Alt+M
+- On reappear, the cursor plays a **shrink animation** (large → normal size) so you can easily spot where it is
 
 ### Scroll Pass-Through (PgUp/PgDn)
 

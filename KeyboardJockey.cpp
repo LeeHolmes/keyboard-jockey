@@ -26,8 +26,24 @@
 #define TARGET_CELL_SIZE_DIP 86  // Target cell size in device-independent pixels (at 96 DPI)
 #define TIMER_ID_RESET 1
 #define TIMER_ID_TAB_TEXT 2
-#define RESET_TIMEOUT_MS 1000
-#define TAB_TEXT_TIMEOUT_MS 2000
+#define RESET_TIMEOUT_MS 3000
+#define TAB_TEXT_TIMEOUT_MS 4000
+#define GRID_ALPHA 160           // Default grid overlay opacity (0-255)
+#define MOUSE_MOVE_ALPHA 100     // Reduced opacity during arrow-key mouse movement
+#define ACTIVATION_DELAY_MS 50   // Brief sleep before activating a window
+#define DEFAULT_DPI 96           // Standard Windows DPI baseline
+#define MAIN_FONT_HEIGHT_PCT 80  // Main label font height as % of sub-cell height
+#define MAIN_FONT_WIDTH_DIV 5    // Main label font width = cellW / this
+#define MIN_MAIN_FONT_SIZE (-8)  // Floor for main label font
+#define SUB_FONT_HEIGHT_PCT 60   // Sub-label font height as % of sub-cell height
+#define MIN_SUB_FONT_SIZE (-6)   // Floor for sub-label font
+#define DT_CENTERED (DT_CENTER | DT_VCENTER | DT_SINGLELINE)
+
+static const wchar_t* GRID_FONT_NAME = L"Segoe UI Variable Display";
+static const wchar_t* SUB_LABELS = L"abcdefgh";
+static const COLORREF COLOR_BLACK = RGB(0, 0, 0);
+static const DWORD CURSOR_IDS[] = { OCR_NORMAL, OCR_IBEAM, OCR_HAND, OCR_CROSS,
+                                    OCR_SIZEALL, OCR_SIZENWSE, OCR_SIZENESW, OCR_SIZEWE, OCR_SIZENS };
 
 // Global variables
 HINSTANCE g_hInstance;
@@ -51,6 +67,20 @@ std::map<std::wstring, POINT> g_gridMap;
 HBITMAP g_hGridBitmap = NULL;
 int g_gridBitmapW = 0;
 int g_gridBitmapH = 0;
+
+// Virtual screen bounds (all monitors combined)
+struct VirtualScreenBounds {
+    int left, top, width, height;
+};
+
+inline VirtualScreenBounds GetVirtualScreenBounds() {
+    return {
+        GetSystemMetrics(SM_XVIRTUALSCREEN),
+        GetSystemMetrics(SM_YVIRTUALSCREEN),
+        GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    };
+}
 
 // Per-monitor info
 struct MonitorInfo {
@@ -102,6 +132,8 @@ std::wstring GenerateLabel(wchar_t monitorPrefix, int index);
 void FilterAppWindowsBySearch();
 void HideCursor();
 void RestoreCursor();
+void MoveMouseByArrowKey(int dx, int dy, int moveAmount);
+void CreateGridFonts(int sh, int cellW, HFONT* outMain, HFONT* outSub);
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 void InstallGlobalKeyboardHook();
@@ -170,25 +202,10 @@ void HideCursor() {
     HCURSOR hBlankCursor = CreateCursor(g_hInstance, 0, 0, 32, 32, andMask, xorMask);
     
     // Copy and set for all standard cursor types
-    HCURSOR hCopy;
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_NORMAL);
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_IBEAM);
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_HAND);
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_CROSS);
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_SIZEALL);
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_SIZENWSE);
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_SIZENESW);
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_SIZEWE);
-    hCopy = CopyCursor(hBlankCursor);
-    SetSystemCursor(hCopy, OCR_SIZENS);
+    for (DWORD id : CURSOR_IDS) {
+        HCURSOR hCopy = CopyCursor(hBlankCursor);
+        SetSystemCursor(hCopy, id);
+    }
     
     DestroyCursor(hBlankCursor);
     
@@ -276,9 +293,7 @@ void SetScaledCursors(int size) {
     HCURSOR hScaled = CreateScaledCursor(g_hSavedArrow, size);
     if (!hScaled) return;
     
-    DWORD cursorIDs[] = { OCR_NORMAL, OCR_IBEAM, OCR_HAND, OCR_CROSS,
-                          OCR_SIZEALL, OCR_SIZENWSE, OCR_SIZENESW, OCR_SIZEWE, OCR_SIZENS };
-    for (DWORD id : cursorIDs) {
+    for (DWORD id : CURSOR_IDS) {
         HCURSOR hCopy = CopyCursor(hScaled);
         SetSystemCursor(hCopy, id);
     }
@@ -400,7 +415,7 @@ BOOL CALLBACK GridMonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lprcMonitor,
     mi.hMonitor = hMon;
     mi.rcMonitor = *lprcMonitor;
     HRESULT hr = GetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &mi.dpiX, &mi.dpiY);
-    if (FAILED(hr)) { mi.dpiX = 96; mi.dpiY = 96; }
+    if (FAILED(hr)) { mi.dpiX = DEFAULT_DPI; mi.dpiY = DEFAULT_DPI; }
     auto* vec = reinterpret_cast<std::vector<MonitorInfo>*>(lParam);
     mi.prefix = L'a' + (wchar_t)vec->size();
     vec->push_back(mi);
@@ -435,7 +450,7 @@ void BuildGridCells() {
         int monHeight = mon.rcMonitor.bottom - mon.rcMonitor.top;
         
         // Scale target cell size by this monitor's DPI
-        int targetCellPx = TARGET_CELL_SIZE_DIP * (int)mon.dpiX / 96;
+        int targetCellPx = TARGET_CELL_SIZE_DIP * (int)mon.dpiX / DEFAULT_DPI;
         
         int gridCols = max(1, monWidth / targetCellPx);
         int gridRows = max(1, monHeight / targetCellPx);
@@ -482,10 +497,11 @@ void BuildGridCells() {
 void RenderBaseGridBitmap() {
     if (g_hGridBitmap) { DeleteObject(g_hGridBitmap); g_hGridBitmap = NULL; }
     
-    int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    auto vs = GetVirtualScreenBounds();
+    int virtualWidth = vs.width;
+    int virtualHeight = vs.height;
+    int virtualLeft = vs.left;
+    int virtualTop = vs.top;
     g_gridBitmapW = virtualWidth;
     g_gridBitmapH = virtualHeight;
     
@@ -495,12 +511,10 @@ void RenderBaseGridBitmap() {
     SelectObject(hdcMem, g_hGridBitmap);
     
     // Black background
-    HBRUSH hBrushBg = CreateSolidBrush(RGB(0, 0, 0));
+    HBRUSH hBrushBg = CreateSolidBrush(COLOR_BLACK);
     RECT rcFull = { 0, 0, virtualWidth, virtualHeight };
     FillRect(hdcMem, &rcFull, hBrushBg);
     DeleteObject(hBrushBg);
-    
-    const wchar_t* subLabels = L"abcdefgh";
     
     // Grid lines
     int gridPenWidth = max(1, virtualHeight / 800);
@@ -558,19 +572,7 @@ void RenderBaseGridBitmap() {
             if (hSubFont) DeleteObject(hSubFont);
             
             int cellW = sw * 3;
-            int fromHeight = sh * 80 / 100;
-            int fromWidth = cellW / 5;
-            int mainFontSize = -min(fromHeight, fromWidth);
-            if (mainFontSize > -8) mainFontSize = -8;
-            hFont = CreateFont(mainFontSize, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
-            
-            int subFontSize = -(sh * 60 / 100);
-            if (subFontSize > -6) subFontSize = -6;
-            hSubFont = CreateFont(subFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+            CreateGridFonts(sh, cellW, &hFont, &hSubFont);
             
             hOldFont = (HFONT)SelectObject(hdcMem, hFont);
             lastSubH = sh;
@@ -585,7 +587,7 @@ void RenderBaseGridBitmap() {
         // Center label
         SelectObject(hdcMem, hFont);
         SetTextColor(hdcMem, RGB(0, 200, 255));
-        DrawText(hdcMem, cell.label.c_str(), -1, &adj, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawText(hdcMem, cell.label.c_str(), -1, &adj, DT_CENTERED);
         
         // Sub-labels
         SelectObject(hdcMem, hSubFont);
@@ -599,8 +601,8 @@ void RenderBaseGridBitmap() {
                 subRect.top = adj.top + sy * sh;
                 subRect.right = subRect.left + sw;
                 subRect.bottom = subRect.top + sh;
-                wchar_t subLabel[2] = { subLabels[subLabelIdx], 0 };
-                DrawText(hdcMem, subLabel, 1, &subRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                wchar_t subLabel[2] = { SUB_LABELS[subLabelIdx], 0 };
+                DrawText(hdcMem, subLabel, 1, &subRect, DT_CENTERED);
                 subLabelIdx++;
             }
         }
@@ -617,13 +619,14 @@ void RenderBaseGridBitmap() {
 // Paint the grid overlay
 void PaintGrid(HDC hdc) {
     // Get virtual screen bounds
-    int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    auto vs = GetVirtualScreenBounds();
+    int virtualLeft = vs.left;
+    int virtualTop = vs.top;
+    int virtualWidth = vs.width;
+    int virtualHeight = vs.height;
     
     // Semi-transparent background
-    HBRUSH hBrushBg = CreateSolidBrush(RGB(0, 0, 0));
+    HBRUSH hBrushBg = CreateSolidBrush(COLOR_BLACK);
     RECT rcFull = { 0, 0, virtualWidth, virtualHeight };
     FillRect(hdc, &rcFull, hBrushBg);
     DeleteObject(hBrushBg);
@@ -633,8 +636,6 @@ void PaintGrid(HDC hdc) {
     
     // If in window highlight or text select mode, skip drawing the grid entirely
     bool highlightMode = (g_highlightIndex >= 0 || g_bTabTextMode || !g_tabSearchStr.empty());
-    
-    const wchar_t* subLabels = L"abcdefgh";
     
   if (!highlightMode) {
     // Blit cached base grid
@@ -662,18 +663,7 @@ void PaintGrid(HDC hdc) {
                 if (hFont) DeleteObject(hFont);
                 if (hSubFont) DeleteObject(hSubFont);
                 int cellW = sw * 3;
-                int fromHeight = sh * 80 / 100;
-                int fromWidth = cellW / 5;
-                int mainFontSize = -min(fromHeight, fromWidth);
-                if (mainFontSize > -8) mainFontSize = -8;
-                hFont = CreateFont(mainFontSize, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                    CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
-                int subFontSize = -(sh * 60 / 100);
-                if (subFontSize > -6) subFontSize = -6;
-                hSubFont = CreateFont(subFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                    CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+                CreateGridFonts(sh, cellW, &hFont, &hSubFont);
                 hOldFont = (HFONT)SelectObject(hdc, hFont);
                 lastSubH = sh;
             }
@@ -694,12 +684,12 @@ void PaintGrid(HDC hdc) {
             
             if (!isMatch && !isPartialMatch) {
                 // Dim non-matching cells
-                HBRUSH hDim = CreateSolidBrush(RGB(0, 0, 0));
+                HBRUSH hDim = CreateSolidBrush(COLOR_BLACK);
                 FillRect(hdc, &adjusted, hDim);
                 DeleteObject(hDim);
                 SelectObject(hdc, hFont);
                 SetTextColor(hdc, RGB(100, 100, 100));
-                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTERED);
                 continue;
             }
             
@@ -723,7 +713,7 @@ void PaintGrid(HDC hdc) {
                 
                 SelectObject(hdc, hFont);
                 SetTextColor(hdc, RGB(255, 255, 255));
-                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTERED);
                 
                 // Draw sub-labels on matched cell
                 SelectObject(hdc, hSubFont);
@@ -750,16 +740,19 @@ void PaintGrid(HDC hdc) {
                         } else {
                             SetTextColor(hdc, RGB(200, 255, 200));
                         }
-                        wchar_t sl[2] = { subLabels[subLabelIdx], 0 };
-                        DrawText(hdc, sl, 1, &subRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                        wchar_t sl[2] = { SUB_LABELS[subLabelIdx], 0 };
+                        DrawText(hdc, sl, 1, &subRect, DT_CENTERED);
                         subLabelIdx++;
                     }
                 }
             } else {
-                // Partial match - just recolor the label
+                // Partial match - subtle green tint so user can still see underneath
+                HBRUSH hPartial = CreateSolidBrush(RGB(0, 40, 0));
+                FillRect(hdc, &adjusted, hPartial);
+                DeleteObject(hPartial);
                 SelectObject(hdc, hFont);
-                SetTextColor(hdc, RGB(150, 230, 255));
-                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SetTextColor(hdc, RGB(180, 255, 180));
+                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTERED);
             }
         }
         
@@ -777,7 +770,7 @@ void PaintGrid(HDC hdc) {
         
         HFONT hLabelFont = CreateFont(-(max(12, virtualHeight / 80)), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+            CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, GRID_FONT_NAME);
         
         for (int idx = startIdx; idx < endIdx && idx < (int)g_appWindows.size(); idx++) {
             const AppWindow& aw = g_appWindows[idx];
@@ -982,7 +975,7 @@ void CycleHighlight(bool forward) {
     }
     
     // Make black background transparent via color key so red highlights stay vivid
-    SetLayeredWindowAttributes(g_hOverlayWnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
+    SetLayeredWindowAttributes(g_hOverlayWnd, COLOR_BLACK, 0, LWA_COLORKEY);
     
     // Reset the tab-to-text timer on each TAB press
     g_bTabTextMode = false;
@@ -997,10 +990,11 @@ void CreateOverlayWindow() {
     if (g_hOverlayWnd) return;
     
     // Get virtual screen bounds (all monitors)
-    int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    auto vs = GetVirtualScreenBounds();
+    int virtualLeft = vs.left;
+    int virtualTop = vs.top;
+    int virtualWidth = vs.width;
+    int virtualHeight = vs.height;
     
     g_hOverlayWnd = CreateWindowEx(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
@@ -1011,8 +1005,8 @@ void CreateOverlayWindow() {
         NULL, NULL, g_hInstance, NULL
     );
     
-    // Set transparency (200 out of 255)
-    SetLayeredWindowAttributes(g_hOverlayWnd, 0, 200, LWA_ALPHA);
+    // Set transparency
+    SetLayeredWindowAttributes(g_hOverlayWnd, 0, GRID_ALPHA, LWA_ALPHA);
 }
 
 // Show the grid overlay
@@ -1035,8 +1029,8 @@ void ShowGrid() {
     g_bMouseMoveMode = false;  // Reset mouse move mode
     CreateOverlayWindow();
     
-    // Reset transparency to full opacity (in case it was reduced in a previous session)
-    SetLayeredWindowAttributes(g_hOverlayWnd, 0, 200, LWA_ALPHA);
+    // Reset transparency to default (in case it was reduced in a previous session)
+    SetLayeredWindowAttributes(g_hOverlayWnd, 0, GRID_ALPHA, LWA_ALPHA);
     
     ShowWindow(g_hOverlayWnd, SW_SHOW);
     SetForegroundWindow(g_hOverlayWnd);
@@ -1103,6 +1097,35 @@ int GetSubPointIndex(wchar_t ch) {
     return 4;  // center as fallback
 }
 
+// Create main and sub-label fonts for a given sub-cell height and cell width
+void CreateGridFonts(int sh, int cellW, HFONT* outMain, HFONT* outSub) {
+    int fromHeight = sh * MAIN_FONT_HEIGHT_PCT / 100;
+    int fromWidth = cellW / MAIN_FONT_WIDTH_DIV;
+    int mainFontSize = -min(fromHeight, fromWidth);
+    if (mainFontSize > MIN_MAIN_FONT_SIZE) mainFontSize = MIN_MAIN_FONT_SIZE;
+    *outMain = CreateFont(mainFontSize, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, GRID_FONT_NAME);
+    int subFontSize = -(sh * SUB_FONT_HEIGHT_PCT / 100);
+    if (subFontSize > MIN_SUB_FONT_SIZE) subFontSize = MIN_SUB_FONT_SIZE;
+    *outSub = CreateFont(subFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, GRID_FONT_NAME);
+}
+
+// Move cursor by arrow key offset and enter mouse-move mode
+void MoveMouseByArrowKey(int dx, int dy, int moveAmount) {
+    POINT pt;
+    GetCursorPos(&pt);
+    pt.x += dx;
+    pt.y += dy;
+    SetCursorPos(pt.x, pt.y);
+    if (!g_bMouseMoveMode) {
+        g_bMouseMoveMode = true;
+        SetLayeredWindowAttributes(g_hOverlayWnd, 0, MOUSE_MOVE_ALPHA, LWA_ALPHA);
+    }
+}
+
 // Process typed character
 void ProcessTypedChar(wchar_t ch) {
     if (!g_bGridVisible) return;
@@ -1117,14 +1140,14 @@ void ProcessTypedChar(wchar_t ch) {
         if (g_highlightIndex >= 0) {
             g_highlightIndex = -1;
             g_appWindows.clear();
-            SetLayeredWindowAttributes(g_hOverlayWnd, 0, 200, LWA_ALPHA);
+            SetLayeredWindowAttributes(g_hOverlayWnd, 0, GRID_ALPHA, LWA_ALPHA);
             InvalidateRect(g_hOverlayWnd, NULL, TRUE);
         }
         
-        // Restore full opacity when typing
+        // Restore default opacity when typing
         if (g_bMouseMoveMode) {
             g_bMouseMoveMode = false;
-            SetLayeredWindowAttributes(g_hOverlayWnd, 0, 200, LWA_ALPHA);
+            SetLayeredWindowAttributes(g_hOverlayWnd, 0, GRID_ALPHA, LWA_ALPHA);
         }
         
         // Reset the timeout timer
@@ -1249,7 +1272,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                 if (g_highlightIndex >= 0 && g_highlightIndex < (int)g_appWindows.size()) {
                     HWND targetWnd = g_appWindows[g_highlightIndex].hwnd;
                     HideGrid();
-                    Sleep(50);
+                    Sleep(ACTIVATION_DELAY_MS);
                     SetForegroundWindow(targetWnd);
                     if (IsIconic(targetWnd)) {
                         ShowWindow(targetWnd, SW_RESTORE);
@@ -1296,55 +1319,22 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         case VK_ESCAPE:
             HideGrid();
             break;
-        case VK_LEFT: {
-            POINT pt;
-            GetCursorPos(&pt);
-            pt.x -= moveAmount;
-            SetCursorPos(pt.x, pt.y);
-            // Go 50% more transparent for mouse movement mode
-            if (!g_bMouseMoveMode) {
-                g_bMouseMoveMode = true;
-                SetLayeredWindowAttributes(g_hOverlayWnd, 0, 100, LWA_ALPHA);
-            }
+        case VK_LEFT:
+            MoveMouseByArrowKey(-moveAmount, 0, moveAmount);
             break;
-        }
-        case VK_RIGHT: {
-            POINT pt;
-            GetCursorPos(&pt);
-            pt.x += moveAmount;
-            SetCursorPos(pt.x, pt.y);
-            if (!g_bMouseMoveMode) {
-                g_bMouseMoveMode = true;
-                SetLayeredWindowAttributes(g_hOverlayWnd, 0, 100, LWA_ALPHA);
-            }
+        case VK_RIGHT:
+            MoveMouseByArrowKey(moveAmount, 0, moveAmount);
             break;
-        }
-        case VK_UP: {
-            POINT pt;
-            GetCursorPos(&pt);
-            pt.y -= moveAmount;
-            SetCursorPos(pt.x, pt.y);
-            if (!g_bMouseMoveMode) {
-                g_bMouseMoveMode = true;
-                SetLayeredWindowAttributes(g_hOverlayWnd, 0, 100, LWA_ALPHA);
-            }
+        case VK_UP:
+            MoveMouseByArrowKey(0, -moveAmount, moveAmount);
             break;
-        }
-        case VK_DOWN: {
-            POINT pt;
-            GetCursorPos(&pt);
-            pt.y += moveAmount;
-            SetCursorPos(pt.x, pt.y);
-            if (!g_bMouseMoveMode) {
-                g_bMouseMoveMode = true;
-                SetLayeredWindowAttributes(g_hOverlayWnd, 0, 100, LWA_ALPHA);
-            }
+        case VK_DOWN:
+            MoveMouseByArrowKey(0, moveAmount, moveAmount);
             break;
-        }
         case VK_SHIFT:
             // Make UI subtle when Shift is pressed (skip in highlight mode)
             if (g_highlightIndex < 0) {
-                SetLayeredWindowAttributes(g_hOverlayWnd, 0, 100, LWA_ALPHA);
+                SetLayeredWindowAttributes(g_hOverlayWnd, 0, MOUSE_MOVE_ALPHA, LWA_ALPHA);
             }
             break;
         case VK_SPACE: {
@@ -1358,7 +1348,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             if (g_highlightIndex >= 0 && g_highlightIndex < (int)g_appWindows.size()) {
                 HWND targetWnd = g_appWindows[g_highlightIndex].hwnd;
                 HideGrid();
-                Sleep(50);
+                Sleep(ACTIVATION_DELAY_MS);
                 // Activate the window
                 SetForegroundWindow(targetWnd);
                 // If minimized, restore it
@@ -1377,7 +1367,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             }
             HideGrid();
             // Small delay to let grid disappear
-            Sleep(50);
+            Sleep(ACTIVATION_DELAY_MS);
             // Check if Ctrl is held for right-click
             if (GetKeyState(VK_CONTROL) & 0x8000) {
                 SendClick(true);  // Right click
@@ -1418,7 +1408,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             if (!g_bScrollMode) {
                 g_bScrollMode = true;
                 // Make overlay fully transparent but keep it for focus
-                SetLayeredWindowAttributes(g_hOverlayWnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
+                SetLayeredWindowAttributes(g_hOverlayWnd, COLOR_BLACK, 0, LWA_COLORKEY);
                 InvalidateRect(g_hOverlayWnd, NULL, TRUE);
                 // Install mouse hook to detect movement
                 g_hScrollMouseHook = SetWindowsHookEx(WH_MOUSE_LL, ScrollMouseProc, g_hInstance, 0);
@@ -1451,7 +1441,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             KillTimer(hWnd, TIMER_ID_TAB_TEXT);
             g_appWindows = g_allAppWindows;
             if (!g_appWindows.empty()) g_highlightIndex = 0;
-            SetLayeredWindowAttributes(g_hOverlayWnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
+            SetLayeredWindowAttributes(g_hOverlayWnd, COLOR_BLACK, 0, LWA_COLORKEY);
             InvalidateRect(hWnd, NULL, TRUE);
             return 0;
         }
@@ -1476,9 +1466,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         if (wParam == VK_SHIFT && g_highlightIndex < 0) {
             // Restore to mouse move mode transparency or full opacity
             if (g_bMouseMoveMode) {
-                SetLayeredWindowAttributes(g_hOverlayWnd, 0, 100, LWA_ALPHA);
+                SetLayeredWindowAttributes(g_hOverlayWnd, 0, MOUSE_MOVE_ALPHA, LWA_ALPHA);
             } else {
-                SetLayeredWindowAttributes(g_hOverlayWnd, 0, 200, LWA_ALPHA);
+                SetLayeredWindowAttributes(g_hOverlayWnd, 0, GRID_ALPHA, LWA_ALPHA);
             }
         }
         return 0;
