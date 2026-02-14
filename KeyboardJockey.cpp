@@ -6,6 +6,8 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <ShellScalingApi.h>
+#pragma comment(lib, "Shcore.lib")
 #include <vector>
 #include <string>
 #include <map>
@@ -21,8 +23,7 @@
 // Constants
 #define WM_TRAYICON (WM_USER + 1)
 #define HOTKEY_ID_SHOW_GRID 1
-#define GRID_COLS 32
-#define GRID_ROWS 12
+#define TARGET_CELL_SIZE_DIP 86  // Target cell size in device-independent pixels (at 96 DPI)
 #define TIMER_ID_RESET 1
 #define TIMER_ID_TAB_TEXT 2
 #define RESET_TIMEOUT_MS 1000
@@ -46,10 +47,24 @@ bool g_bTabTextMode = false;      // True when in TAB "select by text" mode (all
 std::wstring g_typedChars;
 std::map<std::wstring, POINT> g_gridMap;
 
+// Cached base grid bitmap (rendered once at startup)
+HBITMAP g_hGridBitmap = NULL;
+int g_gridBitmapW = 0;
+int g_gridBitmapH = 0;
+
+// Per-monitor info
+struct MonitorInfo {
+    HMONITOR hMonitor;
+    RECT rcMonitor;
+    UINT dpiX, dpiY;
+    wchar_t prefix;  // First letter of labels on this monitor ('a', 'b', ...)
+};
+std::vector<MonitorInfo> g_monitors;
+
 // Grid cell structure
 struct GridCell {
     RECT rect;
-    std::wstring label;
+    std::wstring label;  // 3-letter label: monitor prefix + 2-char cell code
     POINT center;
     POINT subPoints[9];  // 3x3 sub-grid points (0-8, center is 4)
 };
@@ -78,11 +93,12 @@ void CreateOverlayWindow();
 void ShowGrid();
 void HideGrid();
 void BuildGridCells();
+void RenderBaseGridBitmap();
 void PaintGrid(HDC hdc);
 void ProcessTypedChar(wchar_t ch);
 void MoveMouse(POINT pt);
 void SendClick(bool rightClick);
-std::wstring GenerateLabel(int index);
+std::wstring GenerateLabel(wchar_t monitorPrefix, int index);
 void FilterAppWindowsBySearch();
 void HideCursor();
 void RestoreCursor();
@@ -378,13 +394,25 @@ void UninstallGlobalKeyboardHook() {
     }
 }
 
-// Generate label like "aa", "ab", "ac", ... "ba", "bb", etc.
-std::wstring GenerateLabel(int index) {
+// Monitor enumeration callback for DPI-aware per-monitor grids
+BOOL CALLBACK GridMonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lprcMonitor, LPARAM lParam) {
+    MonitorInfo mi;
+    mi.hMonitor = hMon;
+    mi.rcMonitor = *lprcMonitor;
+    HRESULT hr = GetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &mi.dpiX, &mi.dpiY);
+    if (FAILED(hr)) { mi.dpiX = 96; mi.dpiY = 96; }
+    auto* vec = reinterpret_cast<std::vector<MonitorInfo>*>(lParam);
+    mi.prefix = L'a' + (wchar_t)vec->size();
+    vec->push_back(mi);
+    return TRUE;
+}
+
+// Generate 3-letter label: monitor prefix + 2-char cell code
+std::wstring GenerateLabel(wchar_t monitorPrefix, int index) {
     std::wstring label;
-    // Use 2-character combinations: aa-zz gives us 676 combinations
+    label += monitorPrefix;
     int first = index / 26;
     int second = index % 26;
-    
     if (first < 26) {
         label += static_cast<wchar_t>(L'a' + first);
         label += static_cast<wchar_t>(L'a' + second);
@@ -392,55 +420,198 @@ std::wstring GenerateLabel(int index) {
     return label;
 }
 
-// Build grid cells for all monitors
+// Build grid cells per monitor with DPI-aware sizing
 void BuildGridCells() {
     g_cells.clear();
     g_gridMap.clear();
+    g_monitors.clear();
     
-    // Get virtual screen bounds (all monitors)
-    int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    // Enumerate all monitors with DPI info
+    EnumDisplayMonitors(NULL, NULL, GridMonitorEnumProc, reinterpret_cast<LPARAM>(&g_monitors));
     
-    // Calculate cell size
-    int cellWidth = virtualWidth / GRID_COLS;
-    int cellHeight = virtualHeight / GRID_ROWS;
-    
-    // Sub-cell size (1/3 of cell)
-    int subWidth = cellWidth / 3;
-    int subHeight = cellHeight / 3;
-    
-    int index = 0;
-    for (int row = 0; row < GRID_ROWS; row++) {
-        for (int col = 0; col < GRID_COLS; col++) {
-            GridCell cell;
-            cell.rect.left = virtualLeft + col * cellWidth;
-            cell.rect.top = virtualTop + row * cellHeight;
-            cell.rect.right = cell.rect.left + cellWidth;
-            cell.rect.bottom = cell.rect.top + cellHeight;
-            cell.center.x = cell.rect.left + cellWidth / 2;
-            cell.center.y = cell.rect.top + cellHeight / 2;
-            cell.label = GenerateLabel(index);
-            
-            // Calculate 3x3 sub-grid points
-            // Layout: a b c
-            //         d X e
-            //         f g h
-            // Where X is center (index 4)
-            for (int sy = 0; sy < 3; sy++) {
-                for (int sx = 0; sx < 3; sx++) {
-                    int subIdx = sy * 3 + sx;
-                    cell.subPoints[subIdx].x = cell.rect.left + sx * subWidth + subWidth / 2;
-                    cell.subPoints[subIdx].y = cell.rect.top + sy * subHeight + subHeight / 2;
+    // Build grid independently for each monitor
+    for (const auto& mon : g_monitors) {
+        int monWidth = mon.rcMonitor.right - mon.rcMonitor.left;
+        int monHeight = mon.rcMonitor.bottom - mon.rcMonitor.top;
+        
+        // Scale target cell size by this monitor's DPI
+        int targetCellPx = TARGET_CELL_SIZE_DIP * (int)mon.dpiX / 96;
+        
+        int gridCols = max(1, monWidth / targetCellPx);
+        int gridRows = max(1, monHeight / targetCellPx);
+        // Cap to 676 cells per monitor (2-char codes aa-zz)
+        while (gridCols * gridRows > 676) {
+            if (gridCols > gridRows) gridCols--; else gridRows--;
+        }
+        
+        int cellWidth = monWidth / gridCols;
+        int cellHeight = monHeight / gridRows;
+        int subWidth = cellWidth / 3;
+        int subHeight = cellHeight / 3;
+        
+        int index = 0;
+        for (int row = 0; row < gridRows; row++) {
+            for (int col = 0; col < gridCols; col++) {
+                GridCell cell;
+                cell.rect.left = mon.rcMonitor.left + col * cellWidth;
+                cell.rect.top = mon.rcMonitor.top + row * cellHeight;
+                cell.rect.right = cell.rect.left + cellWidth;
+                cell.rect.bottom = cell.rect.top + cellHeight;
+                cell.center.x = cell.rect.left + cellWidth / 2;
+                cell.center.y = cell.rect.top + cellHeight / 2;
+                cell.label = GenerateLabel(mon.prefix, index);
+                
+                // Calculate 3x3 sub-grid points
+                for (int sy = 0; sy < 3; sy++) {
+                    for (int sx = 0; sx < 3; sx++) {
+                        int subIdx = sy * 3 + sx;
+                        cell.subPoints[subIdx].x = cell.rect.left + sx * subWidth + subWidth / 2;
+                        cell.subPoints[subIdx].y = cell.rect.top + sy * subHeight + subHeight / 2;
+                    }
                 }
+                
+                g_cells.push_back(cell);
+                g_gridMap[cell.label] = cell.center;
+                index++;
             }
-            
-            g_cells.push_back(cell);
-            g_gridMap[cell.label] = cell.center;
-            index++;
         }
     }
+}
+
+// Render the static base grid (lines, labels, sub-labels) to a cached bitmap
+void RenderBaseGridBitmap() {
+    if (g_hGridBitmap) { DeleteObject(g_hGridBitmap); g_hGridBitmap = NULL; }
+    
+    int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    g_gridBitmapW = virtualWidth;
+    g_gridBitmapH = virtualHeight;
+    
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    g_hGridBitmap = CreateCompatibleBitmap(hdcScreen, virtualWidth, virtualHeight);
+    SelectObject(hdcMem, g_hGridBitmap);
+    
+    // Black background
+    HBRUSH hBrushBg = CreateSolidBrush(RGB(0, 0, 0));
+    RECT rcFull = { 0, 0, virtualWidth, virtualHeight };
+    FillRect(hdcMem, &rcFull, hBrushBg);
+    DeleteObject(hBrushBg);
+    
+    const wchar_t* subLabels = L"abcdefgh";
+    
+    // Grid lines
+    int gridPenWidth = max(1, virtualHeight / 800);
+    HPEN hPen = CreatePen(PS_SOLID, gridPenWidth, RGB(120, 120, 120));
+    HPEN hSubPen = CreatePen(PS_SOLID, max(1, gridPenWidth / 2), RGB(60, 80, 100));
+    HPEN hOldPen = (HPEN)SelectObject(hdcMem, hPen);
+    
+    for (const auto& cell : g_cells) {
+        int sw = (cell.rect.right - cell.rect.left) / 3;
+        int sh = (cell.rect.bottom - cell.rect.top) / 3;
+        
+        RECT adj;
+        adj.left = cell.rect.left - virtualLeft;
+        adj.top = cell.rect.top - virtualTop;
+        adj.right = cell.rect.right - virtualLeft;
+        adj.bottom = cell.rect.bottom - virtualTop;
+        
+        SelectObject(hdcMem, hPen);
+        MoveToEx(hdcMem, adj.left, adj.top, NULL);
+        LineTo(hdcMem, adj.right, adj.top);
+        LineTo(hdcMem, adj.right, adj.bottom);
+        LineTo(hdcMem, adj.left, adj.bottom);
+        LineTo(hdcMem, adj.left, adj.top);
+        
+        SelectObject(hdcMem, hSubPen);
+        MoveToEx(hdcMem, adj.left + sw, adj.top, NULL);
+        LineTo(hdcMem, adj.left + sw, adj.bottom);
+        MoveToEx(hdcMem, adj.left + sw * 2, adj.top, NULL);
+        LineTo(hdcMem, adj.left + sw * 2, adj.bottom);
+        MoveToEx(hdcMem, adj.left, adj.top + sh, NULL);
+        LineTo(hdcMem, adj.right, adj.top + sh);
+        MoveToEx(hdcMem, adj.left, adj.top + sh * 2, NULL);
+        LineTo(hdcMem, adj.right, adj.top + sh * 2);
+    }
+    
+    SelectObject(hdcMem, hOldPen);
+    DeleteObject(hPen);
+    DeleteObject(hSubPen);
+    
+    // Draw labels
+    SetBkMode(hdcMem, TRANSPARENT);
+    SetTextColor(hdcMem, RGB(0, 200, 255));
+    
+    int lastSubH = 0;
+    HFONT hFont = NULL, hSubFont = NULL;
+    HFONT hOldFont = NULL;
+    
+    for (const auto& cell : g_cells) {
+        int sw = (cell.rect.right - cell.rect.left) / 3;
+        int sh = (cell.rect.bottom - cell.rect.top) / 3;
+        
+        if (sh != lastSubH) {
+            if (hOldFont) { SelectObject(hdcMem, hOldFont); hOldFont = NULL; }
+            if (hFont) DeleteObject(hFont);
+            if (hSubFont) DeleteObject(hSubFont);
+            
+            int cellW = sw * 3;
+            int fromHeight = sh * 80 / 100;
+            int fromWidth = cellW / 5;
+            int mainFontSize = -min(fromHeight, fromWidth);
+            if (mainFontSize > -8) mainFontSize = -8;
+            hFont = CreateFont(mainFontSize, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+            
+            int subFontSize = -(sh * 60 / 100);
+            if (subFontSize > -6) subFontSize = -6;
+            hSubFont = CreateFont(subFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+            
+            hOldFont = (HFONT)SelectObject(hdcMem, hFont);
+            lastSubH = sh;
+        }
+        
+        RECT adj;
+        adj.left = cell.rect.left - virtualLeft;
+        adj.top = cell.rect.top - virtualTop;
+        adj.right = cell.rect.right - virtualLeft;
+        adj.bottom = cell.rect.bottom - virtualTop;
+        
+        // Center label
+        SelectObject(hdcMem, hFont);
+        SetTextColor(hdcMem, RGB(0, 200, 255));
+        DrawText(hdcMem, cell.label.c_str(), -1, &adj, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        
+        // Sub-labels
+        SelectObject(hdcMem, hSubFont);
+        SetTextColor(hdcMem, RGB(140, 180, 220));
+        int subLabelIdx = 0;
+        for (int sy = 0; sy < 3; sy++) {
+            for (int sx = 0; sx < 3; sx++) {
+                if (sx == 1 && sy == 1) continue;
+                RECT subRect;
+                subRect.left = adj.left + sx * sw;
+                subRect.top = adj.top + sy * sh;
+                subRect.right = subRect.left + sw;
+                subRect.bottom = subRect.top + sh;
+                wchar_t subLabel[2] = { subLabels[subLabelIdx], 0 };
+                DrawText(hdcMem, subLabel, 1, &subRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                subLabelIdx++;
+            }
+        }
+    }
+    
+    if (hOldFont) SelectObject(hdcMem, hOldFont);
+    if (hFont) DeleteObject(hFont);
+    if (hSubFont) DeleteObject(hSubFont);
+    
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
 }
 
 // Paint the grid overlay
@@ -463,188 +634,139 @@ void PaintGrid(HDC hdc) {
     // If in window highlight or text select mode, skip drawing the grid entirely
     bool highlightMode = (g_highlightIndex >= 0 || g_bTabTextMode || !g_tabSearchStr.empty());
     
-    // Sub-grid labels: a-h around center (positions 0-3, 5-8, skipping 4 which is center)
     const wchar_t* subLabels = L"abcdefgh";
     
-    // Calculate cell dimensions
-    int cellWidth = virtualWidth / GRID_COLS;
-    int cellHeight = virtualHeight / GRID_ROWS;
-    int subWidth = cellWidth / 3;
-    int subHeight = cellHeight / 3;
-    
   if (!highlightMode) {
-    // Grid lines (scale pen widths)
-    int gridPenWidth = max(1, virtualHeight / 800);
-    HPEN hPen = CreatePen(PS_SOLID, gridPenWidth, RGB(120, 120, 120));
-    HPEN hSubPen = CreatePen(PS_SOLID, max(1, gridPenWidth / 2), RGB(60, 80, 100));  // Subtle sub-grid lines
-    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
-
-    for (const auto& cell : g_cells) {
-        // Adjust coordinates for window position
-        RECT adjusted;
-        adjusted.left = cell.rect.left - virtualLeft;
-        adjusted.top = cell.rect.top - virtualTop;
-        adjusted.right = cell.rect.right - virtualLeft;
-        adjusted.bottom = cell.rect.bottom - virtualTop;
-        
-        // Draw cell border
-        SelectObject(hdc, hPen);
-        MoveToEx(hdc, adjusted.left, adjusted.top, NULL);
-        LineTo(hdc, adjusted.right, adjusted.top);
-        LineTo(hdc, adjusted.right, adjusted.bottom);
-        LineTo(hdc, adjusted.left, adjusted.bottom);
-        LineTo(hdc, adjusted.left, adjusted.top);
-        
-        // Draw subtle 3x3 sub-grid lines
-        SelectObject(hdc, hSubPen);
-        // Vertical sub-lines
-        MoveToEx(hdc, adjusted.left + subWidth, adjusted.top, NULL);
-        LineTo(hdc, adjusted.left + subWidth, adjusted.bottom);
-        MoveToEx(hdc, adjusted.left + subWidth * 2, adjusted.top, NULL);
-        LineTo(hdc, adjusted.left + subWidth * 2, adjusted.bottom);
-        // Horizontal sub-lines
-        MoveToEx(hdc, adjusted.left, adjusted.top + subHeight, NULL);
-        LineTo(hdc, adjusted.right, adjusted.top + subHeight);
-        MoveToEx(hdc, adjusted.left, adjusted.top + subHeight * 2, NULL);
-        LineTo(hdc, adjusted.right, adjusted.top + subHeight * 2);
+    // Blit cached base grid
+    if (g_hGridBitmap) {
+        HDC hdcGrid = CreateCompatibleDC(hdc);
+        SelectObject(hdcGrid, g_hGridBitmap);
+        BitBlt(hdc, 0, 0, g_gridBitmapW, g_gridBitmapH, hdcGrid, 0, 0, SRCCOPY);
+        DeleteDC(hdcGrid);
     }
     
-    SelectObject(hdc, hOldPen);
-    DeleteObject(hPen);
-    DeleteObject(hSubPen);
-    
-    // Draw labels
-    SetBkMode(hdc, TRANSPARENT);
-    
-    // Font for main labels (center) - scale to ~30% of cell height
-    int mainFontSize = -(cellHeight * 30 / 100);
-    if (mainFontSize > -8) mainFontSize = -8;  // minimum readable size
-    HFONT hFont = CreateFont(mainFontSize, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
-    
-    // Font for sub-labels - scale to ~15% of cell height
-    int subFontSize = -(cellHeight * 15 / 100);
-    if (subFontSize > -6) subFontSize = -6;
-    HFONT hSubFont = CreateFont(subFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
-    
-    HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
-    
-    for (const auto& cell : g_cells) {
-        RECT adjusted;
-        adjusted.left = cell.rect.left - virtualLeft;
-        adjusted.top = cell.rect.top - virtualTop;
-        adjusted.right = cell.rect.right - virtualLeft;
-        adjusted.bottom = cell.rect.bottom - virtualTop;
+    // Overlay dynamic highlights for typed chars
+    if (!g_typedChars.empty()) {
+        SetBkMode(hdc, TRANSPARENT);
         
-        // Check if this cell matches typed chars
-        bool isMatch = false;
-        bool isPartialMatch = false;
+        int lastSubH = 0;
+        HFONT hFont = NULL, hSubFont = NULL;
+        HFONT hOldFont = NULL;
         
-        if (g_typedChars.length() >= 2) {
-            std::wstring twoChar = g_typedChars.substr(0, 2);
-            if (cell.label == twoChar) {
-                isMatch = true;
-            }
-        } else if (g_typedChars.length() == 1) {
-            if (cell.label[0] == g_typedChars[0]) {
-                isPartialMatch = true;
-            }
-        }
-        
-        // Highlight matching cell
-        if (isMatch) {
-            HBRUSH hHighlight = CreateSolidBrush(RGB(0, 100, 0));
-            FillRect(hdc, &adjusted, hHighlight);
-            DeleteObject(hHighlight);
+        for (const auto& cell : g_cells) {
+            int sw = (cell.rect.right - cell.rect.left) / 3;
+            int sh = (cell.rect.bottom - cell.rect.top) / 3;
             
-            // Redraw sub-grid lines on highlighted cell
-            HPEN hSubPenLight = CreatePen(PS_SOLID, 1, RGB(0, 150, 0));
-            SelectObject(hdc, hSubPenLight);
-            MoveToEx(hdc, adjusted.left + subWidth, adjusted.top, NULL);
-            LineTo(hdc, adjusted.left + subWidth, adjusted.bottom);
-            MoveToEx(hdc, adjusted.left + subWidth * 2, adjusted.top, NULL);
-            LineTo(hdc, adjusted.left + subWidth * 2, adjusted.bottom);
-            MoveToEx(hdc, adjusted.left, adjusted.top + subHeight, NULL);
-            LineTo(hdc, adjusted.right, adjusted.top + subHeight);
-            MoveToEx(hdc, adjusted.left, adjusted.top + subHeight * 2, NULL);
-            LineTo(hdc, adjusted.right, adjusted.top + subHeight * 2);
-            DeleteObject(hSubPenLight);
-        }
-        
-        // Draw center label (main 2-letter code)
-        int descPad = cellHeight / 10;  // descender padding
-        RECT centerRect;
-        centerRect.left = adjusted.left + subWidth;
-        centerRect.top = adjusted.top + subHeight;
-        centerRect.right = adjusted.left + subWidth * 2;
-        centerRect.bottom = adjusted.top + subHeight * 2 + descPad;
-        
-        SelectObject(hdc, hFont);
-        if (isMatch) {
-            SetTextColor(hdc, RGB(255, 255, 255));
-        } else if (isPartialMatch) {
-            SetTextColor(hdc, RGB(150, 230, 255));
-        } else if (!g_typedChars.empty()) {
-            SetTextColor(hdc, RGB(100, 100, 100));
-        } else {
-            SetTextColor(hdc, RGB(0, 200, 255));
-        }
-        
-        DrawText(hdc, cell.label.c_str(), -1, &centerRect, 
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        
-        // Draw sub-labels a-h around the center
-        SelectObject(hdc, hSubFont);
-        if (isMatch) {
-            SetTextColor(hdc, RGB(200, 255, 200));
-        } else {
-            SetTextColor(hdc, RGB(140, 180, 220));
-        }
-        
-        int subLabelIdx = 0;
-        for (int sy = 0; sy < 3; sy++) {
-            for (int sx = 0; sx < 3; sx++) {
-                if (sx == 1 && sy == 1) continue;  // Skip center
+            if (sh != lastSubH) {
+                if (hOldFont) { SelectObject(hdc, hOldFont); hOldFont = NULL; }
+                if (hFont) DeleteObject(hFont);
+                if (hSubFont) DeleteObject(hSubFont);
+                int cellW = sw * 3;
+                int fromHeight = sh * 80 / 100;
+                int fromWidth = cellW / 5;
+                int mainFontSize = -min(fromHeight, fromWidth);
+                if (mainFontSize > -8) mainFontSize = -8;
+                hFont = CreateFont(mainFontSize, 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+                int subFontSize = -(sh * 60 / 100);
+                if (subFontSize > -6) subFontSize = -6;
+                hSubFont = CreateFont(subFontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+                hOldFont = (HFONT)SelectObject(hdc, hFont);
+                lastSubH = sh;
+            }
+            
+            RECT adjusted;
+            adjusted.left = cell.rect.left - virtualLeft;
+            adjusted.top = cell.rect.top - virtualTop;
+            adjusted.right = cell.rect.right - virtualLeft;
+            adjusted.bottom = cell.rect.bottom - virtualTop;
+            
+            bool isMatch = false;
+            bool isPartialMatch = false;
+            if (g_typedChars.length() >= 3) {
+                if (cell.label == g_typedChars.substr(0, 3)) isMatch = true;
+            } else {
+                if (cell.label.substr(0, g_typedChars.length()) == g_typedChars) isPartialMatch = true;
+            }
+            
+            if (!isMatch && !isPartialMatch) {
+                // Dim non-matching cells
+                HBRUSH hDim = CreateSolidBrush(RGB(0, 0, 0));
+                FillRect(hdc, &adjusted, hDim);
+                DeleteObject(hDim);
+                SelectObject(hdc, hFont);
+                SetTextColor(hdc, RGB(100, 100, 100));
+                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                continue;
+            }
+            
+            if (isMatch) {
+                HBRUSH hHighlight = CreateSolidBrush(RGB(0, 100, 0));
+                FillRect(hdc, &adjusted, hHighlight);
+                DeleteObject(hHighlight);
                 
-                RECT subRect;
-                subRect.left = adjusted.left + sx * subWidth;
-                subRect.top = adjusted.top + sy * subHeight;
-                subRect.right = subRect.left + subWidth;
-                subRect.bottom = subRect.top + subHeight + descPad;
+                HPEN hSubPenLight = CreatePen(PS_SOLID, 1, RGB(0, 150, 0));
+                HPEN hOldPen = (HPEN)SelectObject(hdc, hSubPenLight);
+                MoveToEx(hdc, adjusted.left + sw, adjusted.top, NULL);
+                LineTo(hdc, adjusted.left + sw, adjusted.bottom);
+                MoveToEx(hdc, adjusted.left + sw * 2, adjusted.top, NULL);
+                LineTo(hdc, adjusted.left + sw * 2, adjusted.bottom);
+                MoveToEx(hdc, adjusted.left, adjusted.top + sh, NULL);
+                LineTo(hdc, adjusted.right, adjusted.top + sh);
+                MoveToEx(hdc, adjusted.left, adjusted.top + sh * 2, NULL);
+                LineTo(hdc, adjusted.right, adjusted.top + sh * 2);
+                SelectObject(hdc, hOldPen);
+                DeleteObject(hSubPenLight);
                 
-                // Highlight the selected sub-cell if 3 chars typed
-                if (isMatch && g_typedChars.length() == 3) {
-                    wchar_t subChar = g_typedChars[2];
-                    if (subChar >= L'a' && subChar <= L'h') {
-                        int targetSubIdx = subChar - L'a';
-                        if (targetSubIdx == subLabelIdx) {
-                            HBRUSH hSubHighlight = CreateSolidBrush(RGB(0, 150, 50));
-                            FillRect(hdc, &subRect, hSubHighlight);
-                            DeleteObject(hSubHighlight);
-                            SetTextColor(hdc, RGB(255, 255, 255));
+                SelectObject(hdc, hFont);
+                SetTextColor(hdc, RGB(255, 255, 255));
+                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                
+                // Draw sub-labels on matched cell
+                SelectObject(hdc, hSubFont);
+                int subLabelIdx = 0;
+                for (int sy = 0; sy < 3; sy++) {
+                    for (int sx = 0; sx < 3; sx++) {
+                        if (sx == 1 && sy == 1) continue;
+                        RECT subRect;
+                        subRect.left = adjusted.left + sx * sw;
+                        subRect.top = adjusted.top + sy * sh;
+                        subRect.right = subRect.left + sw;
+                        subRect.bottom = subRect.top + sh;
+                        
+                        if (g_typedChars.length() == 4) {
+                            wchar_t subChar = g_typedChars[3];
+                            if (subChar >= L'a' && subChar <= L'h' && (subChar - L'a') == subLabelIdx) {
+                                HBRUSH hSubHi = CreateSolidBrush(RGB(0, 150, 50));
+                                FillRect(hdc, &subRect, hSubHi);
+                                DeleteObject(hSubHi);
+                                SetTextColor(hdc, RGB(255, 255, 255));
+                            } else {
+                                SetTextColor(hdc, RGB(200, 255, 200));
+                            }
+                        } else {
+                            SetTextColor(hdc, RGB(200, 255, 200));
                         }
+                        wchar_t sl[2] = { subLabels[subLabelIdx], 0 };
+                        DrawText(hdc, sl, 1, &subRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                        subLabelIdx++;
                     }
                 }
-                
-                wchar_t subLabel[2] = { subLabels[subLabelIdx], 0 };
-                DrawText(hdc, subLabel, 1, &subRect, 
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                
-                if (isMatch) {
-                    SetTextColor(hdc, RGB(200, 255, 200));
-                }
-                
-                subLabelIdx++;
+            } else {
+                // Partial match - just recolor the label
+                SelectObject(hdc, hFont);
+                SetTextColor(hdc, RGB(150, 230, 255));
+                DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
         }
+        
+        if (hOldFont) SelectObject(hdc, hOldFont);
+        if (hFont) DeleteObject(hFont);
+        if (hSubFont) DeleteObject(hSubFont);
     }
-    
-    SelectObject(hdc, hOldFont);
-    DeleteObject(hFont);
-    DeleteObject(hSubFont);
   } // end if (!highlightMode)
     if (g_highlightIndex >= 0 && !g_appWindows.empty()) {
         // When search is active or in text mode, highlight ALL matching windows
@@ -911,7 +1033,6 @@ void ShowGrid() {
     
     g_typedChars.clear();
     g_bMouseMoveMode = false;  // Reset mouse move mode
-    BuildGridCells();
     CreateOverlayWindow();
     
     // Reset transparency to full opacity (in case it was reduced in a previous session)
@@ -1012,14 +1133,14 @@ void ProcessTypedChar(wchar_t ch) {
             SetTimer(g_hOverlayWnd, TIMER_ID_RESET, RESET_TIMEOUT_MS, NULL);
         }
         
-        // Check if we have 3 characters (sub-grid selection)
-        if (g_typedChars.length() == 3) {
-            std::wstring twoChar = g_typedChars.substr(0, 2);
-            wchar_t subChar = g_typedChars[2];
+        // Check if we have 4 characters (sub-grid selection)
+        if (g_typedChars.length() == 4) {
+            std::wstring threeChar = g_typedChars.substr(0, 3);
+            wchar_t subChar = g_typedChars[3];
             
             // Find the cell
             for (const auto& cell : g_cells) {
-                if (cell.label == twoChar) {
+                if (cell.label == threeChar) {
                     if (subChar >= L'a' && subChar <= L'h') {
                         int subIdx = GetSubPointIndex(subChar);
                         MoveMouse(cell.subPoints[subIdx]);
@@ -1033,8 +1154,8 @@ void ProcessTypedChar(wchar_t ch) {
             // Clear for next selection
             g_typedChars.clear();
         }
-        // If exactly 2 chars, move to center immediately
-        else if (g_typedChars.length() == 2) {
+        // If exactly 3 chars, move to cell center immediately
+        else if (g_typedChars.length() == 3) {
             auto it = g_gridMap.find(g_typedChars);
             if (it != g_gridMap.end()) {
                 MoveMouse(it->second);
@@ -1081,10 +1202,30 @@ void ShowContextMenu(HWND hWnd) {
 // Overlay window procedure
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_ERASEBKGND:
+        return 1;  // Skip erase — we paint the full surface ourselves
+    
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hWnd, &ps);
-        PaintGrid(hdc);
+        
+        // Double-buffer: paint to off-screen bitmap, then blit
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbmMem = CreateCompatibleBitmap(hdc, w, h);
+        HBITMAP hbmOld = (HBITMAP)SelectObject(hdcMem, hbmMem);
+        
+        PaintGrid(hdcMem);
+        
+        BitBlt(hdc, 0, 0, w, h, hdcMem, 0, 0, SRCCOPY);
+        
+        SelectObject(hdcMem, hbmOld);
+        DeleteObject(hbmMem);
+        DeleteDC(hdcMem);
+        
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -1226,10 +1367,10 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                 }
                 break;
             }
-            // If we have 2 chars typed, move to center before clicking
-            if (g_typedChars.length() >= 2) {
-                std::wstring twoChar = g_typedChars.substr(0, 2);
-                auto it = g_gridMap.find(twoChar);
+            // If we have 3 chars typed, move to center before clicking
+            if (g_typedChars.length() >= 3) {
+                std::wstring threeChar = g_typedChars.substr(0, 3);
+                auto it = g_gridMap.find(threeChar);
                 if (it != g_gridMap.end()) {
                     MoveMouse(it->second);
                 }
@@ -1399,6 +1540,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         if (!RegisterHotKey(hWnd, HOTKEY_ID_SHOW_GRID, MOD_CONTROL | MOD_ALT, 'M')) {
             MessageBox(hWnd, L"Failed to register hotkey Ctrl+Alt+M", L"Error", MB_ICONERROR);
         }
+        // Pre-build grid cells and cache base grid bitmap
+        BuildGridCells();
+        RenderBaseGridBitmap();
         // Install global keyboard hook for cursor hiding while typing
         InstallGlobalKeyboardHook();
         return 0;
@@ -1438,6 +1582,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_DESTROY:
         UnregisterHotKey(hWnd, HOTKEY_ID_SHOW_GRID);
         RemoveTrayIcon();
+        if (g_hGridBitmap) { DeleteObject(g_hGridBitmap); g_hGridBitmap = NULL; }
         UninstallGlobalKeyboardHook();  // Remove keyboard hook
         RestoreCursor();  // Make sure cursor is restored on exit
         if (g_hOverlayWnd) {
@@ -1490,7 +1635,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     wcOverlay.lpfnWndProc = OverlayWndProc;
     wcOverlay.hInstance = hInstance;
     wcOverlay.hCursor = LoadCursor(NULL, IDC_CROSS);
-    wcOverlay.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wcOverlay.hbrBackground = NULL;
     wcOverlay.lpszClassName = L"KeyboardJockeyOverlay";
     
     if (!RegisterClassEx(&wcOverlay)) {
