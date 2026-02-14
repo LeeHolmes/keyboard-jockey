@@ -10,9 +10,13 @@ Launch `KeyboardJockey.exe`. It minimizes to the system tray immediately. Press 
 
 ### Grid Navigation
 
+<img width="1913" height="1129" alt="image" src="https://github.com/user-attachments/assets/beb9e7cd-05cd-476d-a7d6-33c78f2cdc2e" />
+
 Press **Ctrl+Alt+M** to show a full-screen overlay grid. Each cell is labeled with a short letter code. Type the letters to move the mouse to that cell, then press **Enter** to click. Hold **Ctrl+Enter** for a right-click.
 
 If you need further accuracy, each cell also contains a 3×3 sub-grid labeled **a–h** (around the center). After typing a cell code, type one more letter to move the mouse to a specific sub-position within that cell.
+
+<img width="1940" height="1136" alt="image" src="https://github.com/user-attachments/assets/542c9972-1d19-43c4-a9b9-d696486bf2f9" />
 
 If the content is too obscured by the grid, hold down **Shift** to make your desktop more visible.
 
@@ -29,6 +33,8 @@ The grid fades to semi-transparent during arrow key movement so you can see what
 ### Window Switching (TAB Mode)
 
 Press **Tab** while the grid is showing to cycle through open application windows. Each window is highlighted with a red border and a title label showing its position in the list. Unlike traditional Windows Alt+Tab behaviour (which cycles through by order of last use), windows are sorted by visible area (most visible first).
+
+<img width="1913" height="1180" alt="image" src="https://github.com/user-attachments/assets/8a674c16-8a85-4009-b95b-31b6ff27e8ef" />
 
 - **Tab**: Next window
 - **Shift+Tab**: Previous window
@@ -94,3 +100,4 @@ The output is `x64\Release\KeyboardJockey.exe`.
 | **Backspace** | TAB mode | Delete last search character |
 | **PgUp/PgDn** | Grid mode | Scroll content under cursor |
 | **Escape** | Any mode | Close overlay |
+
