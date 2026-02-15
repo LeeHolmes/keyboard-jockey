@@ -30,6 +30,8 @@ The grid uses a **checkerboard pattern** — alternating cells are tinted with t
 
 If the content is too obscured by the grid, hold down **Shift** to fade the overlay to 80% transparent so you can see your desktop.
 
+Press **\*** at any time to jump directly into **Select Window By Name** mode (see below).
+
 ### Arrow Key Fine-Tuning
 
 Once the grid is visible, use the **arrow keys** to nudge the mouse:
@@ -126,7 +128,7 @@ The output is `x64\Release\KeyboardJockey.exe`.
 | **Shift+Tab** | TAB mode | Previous window |
 | **Enter** | TAB mode | Activate highlighted window |
 | **a–z** | TAB mode | Filter windows by title substring |
-| **\*** | TAB mode | Show all windows (including hidden) |
+| **\*** | Grid / TAB mode | Select window by name |
 | **Backspace** | TAB mode | Delete last search character |
 | **Tab** | Text-search mode | Return to normal TAB cycling |
 | **PgUp/PgDn** | Grid mode | Scroll content under cursor |

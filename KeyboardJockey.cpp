@@ -2394,8 +2394,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             ExitScrollMode();
             return 0;
         }
-        if (ch == L'*' && (g_highlightIndex >= 0 || !g_tabSearchStr.empty()) && !g_bTabTextMode) {
-            // Enter "all windows" mode immediately
+        if (ch == L'*' && !g_bTabTextMode) {
+            // Enter "Select Window By Name" mode from grid or TAB mode
+            EnumerateAppWindows();
             g_bTabTextMode = true;
             g_tabSearchStr.clear();
             KillTimer(hWnd, TIMER_ID_TAB_TEXT);
