@@ -12,6 +12,7 @@
 #include <string>
 #include <map>
 #include <cstdlib>
+#include <cmath>
 #include <algorithm>
 #include <thread>
 
@@ -19,6 +20,7 @@
 #define IDI_KEYBOARDJOCKEY 101
 #define IDM_EXIT 1001
 #define IDM_SHOW 1002
+#define IDM_PALETTE 1003
 
 // Constants
 #define WM_TRAYICON (WM_USER + 1)
@@ -29,7 +31,8 @@
 #define RESET_TIMEOUT_MS 3000
 #define TAB_TEXT_TIMEOUT_MS 4000
 #define GRID_ALPHA 160           // Default grid overlay opacity (0-255)
-#define MOUSE_MOVE_ALPHA 100     // Reduced opacity during arrow-key mouse movement
+#define MOUSE_MOVE_ALPHA 0       // Overlay fully invisible during arrow-key mouse movement
+#define SHIFT_PEEK_ALPHA 51      // 80% transparent peek when Shift held in typing mode
 #define ACTIVATION_DELAY_MS 50   // Brief sleep before activating a window
 #define DEFAULT_DPI 96           // Standard Windows DPI baseline
 #define MAIN_FONT_HEIGHT_PCT 80  // Main label font height as % of sub-cell height
@@ -41,9 +44,106 @@
 
 static const wchar_t* GRID_FONT_NAME = L"Segoe UI Variable Display";
 static const wchar_t* SUB_LABELS = L"abcdefgh";
-static const COLORREF COLOR_BLACK = RGB(0, 0, 0);
 static const DWORD CURSOR_IDS[] = { OCR_NORMAL, OCR_IBEAM, OCR_HAND, OCR_CROSS,
                                     OCR_SIZEALL, OCR_SIZENWSE, OCR_SIZENESW, OCR_SIZEWE, OCR_SIZENS };
+
+// Centralized color palette – all colors generated from a single base hue
+struct Palette {
+    // Base grid
+    COLORREF background;              // Overall background fill
+    COLORREF cellBgEven;              // Checkerboard cell fill (even)
+    COLORREF cellBgOdd;               // Checkerboard cell fill (odd)
+    COLORREF gridLine;                // Major cell border lines
+    COLORREF subGridLine;             // 3×3 sub-grid lines inside each cell
+    COLORREF mainLabelText;           // Main 3-letter label text
+    COLORREF subLabelText;            // Sub-label text (a–h)
+
+    // Typing – fully matched cell
+    COLORREF matchCellBg;             // Background of the matched cell
+    COLORREF matchGridLine;           // Sub-grid lines on the matched cell
+    COLORREF matchLabelText;          // Main label on the matched cell
+    COLORREF matchSubLabelText;       // Sub-labels on the matched cell
+    COLORREF matchSubHighlightBg;     // Highlighted sub-cell background
+    COLORREF matchSubHighlightText;   // Highlighted sub-cell text
+
+    // Typing – partial match
+    COLORREF partialMatchBg;          // Partially matched cell background
+    COLORREF partialMatchText;        // Text on partially matched cell
+
+    // Typing – non-match (dimmed)
+    COLORREF dimBg;                   // Dimmed non-matching cell background
+    COLORREF dimText;                 // Dimmed non-matching cell text
+
+    // Window highlight (TAB mode) reuses: mainLabelText, gridLine,
+    //   matchCellBg, cellBgEven, matchLabelText
+    // Minimized panel reuses: background, gridLine, mainLabelText,
+    //   subLabelText, matchSubHighlightBg, matchSubHighlightText
+};
+
+// --- HSL → RGB conversion for generative palette ---
+static COLORREF hsl(float h, float s, float l) {
+    h = fmodf(h, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    float c = (1.0f - fabsf(2.0f * l - 1.0f)) * s;
+    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = l - c / 2.0f;
+    float r, g, b;
+    if      (h < 60.0f)  { r = c; g = x; b = 0; }
+    else if (h < 120.0f) { r = x; g = c; b = 0; }
+    else if (h < 180.0f) { r = 0; g = c; b = x; }
+    else if (h < 240.0f) { r = 0; g = x; b = c; }
+    else if (h < 300.0f) { r = x; g = 0; b = c; }
+    else                  { r = c; g = 0; b = x; }
+    return RGB(
+        max(0, min(255, (int)((r + m) * 255.0f + 0.5f))),
+        max(0, min(255, (int)((g + m) * 255.0f + 0.5f))),
+        max(0, min(255, (int)((b + m) * 255.0f + 0.5f))));
+}
+
+// Color wheel:  0°=Red  30°=Orange  60°=Yellow  120°=Green
+//               180°=Cyan  210°=Azure  240°=Blue  270°=Purple  300°=Magenta
+//
+// ► Change BASE_HUE to shift the entire UI to your favorite color.
+#define BASE_HUE_DEFAULT 30.0f  // 30 = woodsy amber (default)
+                                  // Try: 270 = purple, 210 = ocean blue, 0 = crimson,
+                                  //      160 = teal, 340 = rose, 60 = golden
+
+static float g_baseHue = BASE_HUE_DEFAULT;  // Current hue – changed at runtime by palette picker
+
+static Palette GeneratePalette(float H) {
+    float A = H + 90.0f;  // accent hue – 90° offset for natural contrast
+
+    Palette p;
+    //                               Hue          Sat    Light
+    // -- base grid ------------------------------------------------
+    p.background            = hsl(H,         0.40f, 0.04f);  // very dark base
+    p.cellBgEven            = hsl(H,         0.40f, 0.12f);  // dark base tint
+    p.cellBgOdd             = hsl(A,         0.35f, 0.12f);  // dark accent (checker)
+    p.gridLine              = hsl(H,         0.25f, 0.32f);  // medium base
+    p.subGridLine           = hsl(H + 45,    0.20f, 0.25f);  // muted mid-tone
+    p.mainLabelText         = hsl(H + 10,    0.65f, 0.65f);  // bright warm label
+    p.subLabelText          = hsl(A - 20,    0.30f, 0.58f);  // medium accent
+
+    // -- typing: full match ---------------------------------------
+    p.matchCellBg           = hsl(A,         0.45f, 0.20f);  // rich accent bg
+    p.matchGridLine         = hsl(A,         0.45f, 0.33f);  // bright accent lines
+    p.matchLabelText        = hsl(H,         0.20f, 0.90f);  // near-white base tint
+    p.matchSubLabelText     = hsl(A,         0.35f, 0.72f);  // light accent
+    p.matchSubHighlightBg   = hsl(A,         0.55f, 0.33f);  // vivid accent
+    p.matchSubHighlightText = hsl(H,         0.10f, 0.95f);  // near-white
+
+    // -- typing: partial match ------------------------------------
+    p.partialMatchBg        = hsl(A,         0.35f, 0.12f);  // subtle accent
+    p.partialMatchText      = hsl(A,         0.45f, 0.75f);  // bright accent
+
+    // -- typing: non-match (dimmed) -------------------------------
+    p.dimBg                 = hsl(H,         0.30f, 0.04f);  // fade to background
+    p.dimText               = hsl(H,         0.20f, 0.25f);  // muted base
+
+    return p;
+}
+
+static Palette g_palette = GeneratePalette(BASE_HUE_DEFAULT);
 
 // Global variables
 HINSTANCE g_hInstance;
@@ -97,6 +197,7 @@ struct GridCell {
     std::wstring label;  // 3-letter label: monitor prefix + 2-char cell code
     POINT center;
     POINT subPoints[9];  // 3x3 sub-grid points (0-8, center is 4)
+    int gridRow, gridCol; // Position in the monitor grid (for checkerboard)
 };
 
 std::vector<GridCell> g_cells;
@@ -110,15 +211,22 @@ struct AppWindow {
 };
 std::vector<AppWindow> g_appWindows;
 std::vector<AppWindow> g_allAppWindows;  // All enumerated windows (including 0 visible area)
+std::vector<AppWindow> g_minimizedWindows;  // Minimized windows
+std::vector<AppWindow> g_allMinimizedWindows;  // All minimized (before search filter)
 int g_highlightIndex = -1;  // -1 = no highlight active
 std::wstring g_tabSearchStr;  // Substring search in TAB mode
+
+HWND g_hPaletteWnd = NULL;  // Palette picker window
 
 // Forward declarations
 LRESULT CALLBACK MainWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK OverlayWndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK PaletteWndProc(HWND, UINT, WPARAM, LPARAM);
 void CreateTrayIcon(HWND hWnd);
 void RemoveTrayIcon();
 void ShowContextMenu(HWND hWnd);
+void ShowPaletteWindow();
+void ApplyHue(float hue);
 void CreateOverlayWindow();
 void ShowGrid();
 void HideGrid();
@@ -166,6 +274,9 @@ LRESULT CALLBACK ScrollMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 void ExitScrollMode() {
     if (!g_bScrollMode) return;
     g_bScrollMode = false;
+    // Remove input-transparent flag so overlay receives input again
+    LONG_PTR exStyle = GetWindowLongPtr(g_hOverlayWnd, GWL_EXSTYLE);
+    SetWindowLongPtr(g_hOverlayWnd, GWL_EXSTYLE, exStyle & ~WS_EX_TRANSPARENT);
     if (g_hScrollMouseHook) {
         UnhookWindowsHookEx(g_hScrollMouseHook);
         g_hScrollMouseHook = NULL;
@@ -475,6 +586,8 @@ void BuildGridCells() {
                 cell.center.x = cell.rect.left + cellWidth / 2;
                 cell.center.y = cell.rect.top + cellHeight / 2;
                 cell.label = GenerateLabel(mon.prefix, index);
+                cell.gridRow = row;
+                cell.gridCol = col;
                 
                 // Calculate 3x3 sub-grid points
                 for (int sy = 0; sy < 3; sy++) {
@@ -510,16 +623,31 @@ void RenderBaseGridBitmap() {
     g_hGridBitmap = CreateCompatibleBitmap(hdcScreen, virtualWidth, virtualHeight);
     SelectObject(hdcMem, g_hGridBitmap);
     
-    // Black background
-    HBRUSH hBrushBg = CreateSolidBrush(COLOR_BLACK);
+    // Background fill
+    HBRUSH hBrushBg = CreateSolidBrush(g_palette.background);
     RECT rcFull = { 0, 0, virtualWidth, virtualHeight };
     FillRect(hdcMem, &rcFull, hBrushBg);
     DeleteObject(hBrushBg);
     
+    // Checkerboard cell backgrounds
+    HBRUSH hBrushEven = CreateSolidBrush(g_palette.cellBgEven);
+    HBRUSH hBrushOdd  = CreateSolidBrush(g_palette.cellBgOdd);
+    for (const auto& cell : g_cells) {
+        RECT adj;
+        adj.left   = cell.rect.left   - virtualLeft;
+        adj.top    = cell.rect.top    - virtualTop;
+        adj.right  = cell.rect.right  - virtualLeft;
+        adj.bottom = cell.rect.bottom - virtualTop;
+        bool isEven = ((cell.gridRow + cell.gridCol) % 2 == 0);
+        FillRect(hdcMem, &adj, isEven ? hBrushEven : hBrushOdd);
+    }
+    DeleteObject(hBrushEven);
+    DeleteObject(hBrushOdd);
+    
     // Grid lines
     int gridPenWidth = max(1, virtualHeight / 800);
-    HPEN hPen = CreatePen(PS_SOLID, gridPenWidth, RGB(120, 120, 120));
-    HPEN hSubPen = CreatePen(PS_SOLID, max(1, gridPenWidth / 2), RGB(60, 80, 100));
+    HPEN hPen = CreatePen(PS_SOLID, gridPenWidth, g_palette.gridLine);
+    HPEN hSubPen = CreatePen(PS_SOLID, max(1, gridPenWidth / 2), g_palette.subGridLine);
     HPEN hOldPen = (HPEN)SelectObject(hdcMem, hPen);
     
     for (const auto& cell : g_cells) {
@@ -556,7 +684,7 @@ void RenderBaseGridBitmap() {
     
     // Draw labels
     SetBkMode(hdcMem, TRANSPARENT);
-    SetTextColor(hdcMem, RGB(0, 200, 255));
+    SetTextColor(hdcMem, g_palette.mainLabelText);
     
     int lastSubH = 0;
     HFONT hFont = NULL, hSubFont = NULL;
@@ -586,12 +714,12 @@ void RenderBaseGridBitmap() {
         
         // Center label
         SelectObject(hdcMem, hFont);
-        SetTextColor(hdcMem, RGB(0, 200, 255));
+        SetTextColor(hdcMem, g_palette.mainLabelText);
         DrawText(hdcMem, cell.label.c_str(), -1, &adj, DT_CENTERED);
         
         // Sub-labels
         SelectObject(hdcMem, hSubFont);
-        SetTextColor(hdcMem, RGB(140, 180, 220));
+        SetTextColor(hdcMem, g_palette.subLabelText);
         int subLabelIdx = 0;
         for (int sy = 0; sy < 3; sy++) {
             for (int sx = 0; sx < 3; sx++) {
@@ -626,7 +754,7 @@ void PaintGrid(HDC hdc) {
     int virtualHeight = vs.height;
     
     // Semi-transparent background
-    HBRUSH hBrushBg = CreateSolidBrush(COLOR_BLACK);
+    HBRUSH hBrushBg = CreateSolidBrush(g_palette.background);
     RECT rcFull = { 0, 0, virtualWidth, virtualHeight };
     FillRect(hdc, &rcFull, hBrushBg);
     DeleteObject(hBrushBg);
@@ -684,21 +812,21 @@ void PaintGrid(HDC hdc) {
             
             if (!isMatch && !isPartialMatch) {
                 // Dim non-matching cells
-                HBRUSH hDim = CreateSolidBrush(COLOR_BLACK);
+                HBRUSH hDim = CreateSolidBrush(g_palette.dimBg);
                 FillRect(hdc, &adjusted, hDim);
                 DeleteObject(hDim);
                 SelectObject(hdc, hFont);
-                SetTextColor(hdc, RGB(100, 100, 100));
+                SetTextColor(hdc, g_palette.dimText);
                 DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTERED);
                 continue;
             }
             
             if (isMatch) {
-                HBRUSH hHighlight = CreateSolidBrush(RGB(0, 100, 0));
+                HBRUSH hHighlight = CreateSolidBrush(g_palette.matchCellBg);
                 FillRect(hdc, &adjusted, hHighlight);
                 DeleteObject(hHighlight);
                 
-                HPEN hSubPenLight = CreatePen(PS_SOLID, 1, RGB(0, 150, 0));
+                HPEN hSubPenLight = CreatePen(PS_SOLID, 1, g_palette.matchGridLine);
                 HPEN hOldPen = (HPEN)SelectObject(hdc, hSubPenLight);
                 MoveToEx(hdc, adjusted.left + sw, adjusted.top, NULL);
                 LineTo(hdc, adjusted.left + sw, adjusted.bottom);
@@ -712,7 +840,7 @@ void PaintGrid(HDC hdc) {
                 DeleteObject(hSubPenLight);
                 
                 SelectObject(hdc, hFont);
-                SetTextColor(hdc, RGB(255, 255, 255));
+                SetTextColor(hdc, g_palette.matchLabelText);
                 DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTERED);
                 
                 // Draw sub-labels on matched cell
@@ -730,15 +858,15 @@ void PaintGrid(HDC hdc) {
                         if (g_typedChars.length() == 4) {
                             wchar_t subChar = g_typedChars[3];
                             if (subChar >= L'a' && subChar <= L'h' && (subChar - L'a') == subLabelIdx) {
-                                HBRUSH hSubHi = CreateSolidBrush(RGB(0, 150, 50));
+                                HBRUSH hSubHi = CreateSolidBrush(g_palette.matchSubHighlightBg);
                                 FillRect(hdc, &subRect, hSubHi);
                                 DeleteObject(hSubHi);
-                                SetTextColor(hdc, RGB(255, 255, 255));
+                                SetTextColor(hdc, g_palette.matchSubHighlightText);
                             } else {
-                                SetTextColor(hdc, RGB(200, 255, 200));
+                                SetTextColor(hdc, g_palette.matchSubLabelText);
                             }
                         } else {
-                            SetTextColor(hdc, RGB(200, 255, 200));
+                            SetTextColor(hdc, g_palette.matchSubLabelText);
                         }
                         wchar_t sl[2] = { SUB_LABELS[subLabelIdx], 0 };
                         DrawText(hdc, sl, 1, &subRect, DT_CENTERED);
@@ -747,11 +875,11 @@ void PaintGrid(HDC hdc) {
                 }
             } else {
                 // Partial match - subtle green tint so user can still see underneath
-                HBRUSH hPartial = CreateSolidBrush(RGB(0, 40, 0));
+                HBRUSH hPartial = CreateSolidBrush(g_palette.partialMatchBg);
                 FillRect(hdc, &adjusted, hPartial);
                 DeleteObject(hPartial);
                 SelectObject(hdc, hFont);
-                SetTextColor(hdc, RGB(180, 255, 180));
+                SetTextColor(hdc, g_palette.partialMatchText);
                 DrawText(hdc, cell.label.c_str(), -1, &adjusted, DT_CENTERED);
             }
         }
@@ -785,7 +913,7 @@ void PaintGrid(HDC hdc) {
         // Draw thick red border (scaled to screen)
             int thickness = max(2, virtualHeight / 400);
             bool isCurrent = (idx == g_highlightIndex);
-            HBRUSH hBorderBrush = CreateSolidBrush(isCurrent ? RGB(255, 0, 0) : RGB(255, 100, 100));
+            HBRUSH hBorderBrush = CreateSolidBrush(isCurrent ? g_palette.mainLabelText : g_palette.gridLine);
             
             // Top edge
             RECT edge = { hr.left, hr.top, hr.right, hr.top + thickness };
@@ -816,11 +944,11 @@ void PaintGrid(HDC hdc) {
             if (labelY < 0) labelY = hr.top + thickness;
             
             RECT labelBg = { labelX, labelY, labelX + textSize.cx + 8, labelY + textSize.cy + 8 };
-            HBRUSH hLabelBg = CreateSolidBrush(isCurrent ? RGB(200, 0, 0) : RGB(150, 50, 50));
+            HBRUSH hLabelBg = CreateSolidBrush(isCurrent ? g_palette.matchCellBg : g_palette.cellBgEven);
             FillRect(hdc, &labelBg, hLabelBg);
             DeleteObject(hLabelBg);
             
-            SetTextColor(hdc, RGB(255, 255, 255));
+            SetTextColor(hdc, g_palette.matchLabelText);
             SetBkMode(hdc, TRANSPARENT);
             RECT labelRect = { labelX + 4, labelY + 2, labelBg.right, labelBg.bottom };
             DrawText(hdc, labelBuf, -1, &labelRect, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
@@ -829,6 +957,92 @@ void PaintGrid(HDC hdc) {
         }
         
         DeleteObject(hLabelFont);
+    }
+    
+    // Draw minimized windows panel (bottom-right of primary monitor) - only in text search mode
+    if ((g_bTabTextMode || !g_tabSearchStr.empty()) && !g_minimizedWindows.empty()) {
+        // Get primary monitor work area
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfo(MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &mi);
+        RECT workArea = mi.rcWork;
+        
+        int panelPad = max(8, virtualHeight / 200);
+        int lineH = max(18, virtualHeight / 60);
+        int titleH = lineH + panelPad;
+        int maxItems = min((int)g_minimizedWindows.size(), 20);  // cap to 20 rows
+        int panelH = titleH + maxItems * lineH + panelPad * 2;
+        int panelW = max(250, virtualWidth / 5);
+        
+        // Position: bottom-right of primary monitor work area
+        int panelX = (workArea.right - virtualLeft) - panelW - panelPad;
+        int panelY = (workArea.bottom - virtualTop) - panelH - panelPad;
+        
+        RECT panelRect = { panelX, panelY, panelX + panelW, panelY + panelH };
+        
+        // Panel background
+        HBRUSH hPanelBg = CreateSolidBrush(g_palette.cellBgEven);
+        FillRect(hdc, &panelRect, hPanelBg);
+        DeleteObject(hPanelBg);
+        
+        // Panel border
+        int borderT = max(1, virtualHeight / 500);
+        HBRUSH hPanelBorder = CreateSolidBrush(g_palette.gridLine);
+        RECT be;
+        be = { panelRect.left, panelRect.top, panelRect.right, panelRect.top + borderT };
+        FillRect(hdc, &be, hPanelBorder);
+        be = { panelRect.left, panelRect.bottom - borderT, panelRect.right, panelRect.bottom };
+        FillRect(hdc, &be, hPanelBorder);
+        be = { panelRect.left, panelRect.top, panelRect.left + borderT, panelRect.bottom };
+        FillRect(hdc, &be, hPanelBorder);
+        be = { panelRect.right - borderT, panelRect.top, panelRect.right, panelRect.bottom };
+        FillRect(hdc, &be, hPanelBorder);
+        DeleteObject(hPanelBorder);
+        
+        // Title font (bold)
+        HFONT hTitleFont = CreateFont(-(lineH * 80 / 100), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, GRID_FONT_NAME);
+        // Item font (normal)
+        HFONT hItemFont = CreateFont(-(lineH * 70 / 100), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, GRID_FONT_NAME);
+        
+        SetBkMode(hdc, TRANSPARENT);
+        
+        // Draw title
+        HFONT hPrevFont = (HFONT)SelectObject(hdc, hTitleFont);
+        SetTextColor(hdc, g_palette.mainLabelText);
+        RECT titleRect = { panelX + panelPad, panelY + panelPad, panelX + panelW - panelPad, panelY + titleH };
+        DrawText(hdc, L"Minimized applications", -1, &titleRect, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        
+        // Draw items
+        SelectObject(hdc, hItemFont);
+        int totalNormal = (int)g_appWindows.size();
+        for (int i = 0; i < maxItems; i++) {
+            int itemY = panelY + titleH + i * lineH;
+            RECT itemRect = { panelX + panelPad, itemY, panelX + panelW - panelPad, itemY + lineH };
+            
+            // Check if this minimized item is the current highlight
+            bool isCurrent = (g_highlightIndex >= totalNormal && (g_highlightIndex - totalNormal) == i);
+            
+            if (isCurrent) {
+                RECT hlRect = { panelX + borderT, itemY, panelX + panelW - borderT, itemY + lineH };
+                HBRUSH hItemHl = CreateSolidBrush(g_palette.matchSubHighlightBg);
+                FillRect(hdc, &hlRect, hItemHl);
+                DeleteObject(hItemHl);
+                SetTextColor(hdc, g_palette.matchSubHighlightText);
+            } else {
+                SetTextColor(hdc, g_palette.subLabelText);
+            }
+            
+            wchar_t itemBuf[300];
+            swprintf_s(itemBuf, L" %s", g_minimizedWindows[i].title.c_str());
+            DrawText(hdc, itemBuf, -1, &itemRect, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        
+        SelectObject(hdc, hPrevFont);
+        DeleteObject(hTitleFont);
+        DeleteObject(hItemFont);
     }
 }
 
@@ -840,9 +1054,6 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     // Must be visible
     if (!IsWindowVisible(hwnd)) return TRUE;
     
-    // Skip minimized windows
-    if (IsIconic(hwnd)) return TRUE;
-    
     // Must have a non-empty title
     wchar_t title[256] = {};
     GetWindowText(hwnd, title, 256);
@@ -851,6 +1062,17 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     // Skip tool windows and other non-app windows
     LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
     if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+    
+    // Collect minimized windows separately
+    if (IsIconic(hwnd)) {
+        AppWindow aw;
+        aw.hwnd = hwnd;
+        GetWindowRect(hwnd, &aw.rect);
+        aw.title = title;
+        aw.visibleArea = 0;
+        g_minimizedWindows.push_back(aw);
+        return TRUE;
+    }
     
     // Must have some area
     RECT rc;
@@ -878,6 +1100,7 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
 
 void EnumerateAppWindows() {
     g_appWindows.clear();
+    g_minimizedWindows.clear();
     EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&g_appWindows));
     // EnumWindows returns in Z-order (front to back)
     
@@ -921,6 +1144,9 @@ void EnumerateAppWindows() {
     // Store all windows (including 0 visible area) for search
     g_allAppWindows = g_appWindows;
     
+    // Store all minimized windows for search
+    g_allMinimizedWindows = g_minimizedWindows;
+    
     // Remove windows with 0 visible area from the cycling list
     g_appWindows.erase(
         std::remove_if(g_appWindows.begin(), g_appWindows.end(),
@@ -948,34 +1174,47 @@ void FilterAppWindowsBySearch() {
         }
     }
     
+    // Also filter minimized windows
+    g_minimizedWindows.clear();
+    for (const auto& aw : g_allMinimizedWindows) {
+        std::wstring titleLower = aw.title;
+        for (auto& c : titleLower) c = towlower(c);
+        if (titleLower.find(searchLower) != std::wstring::npos) {
+            g_minimizedWindows.push_back(aw);
+        }
+    }
+    
     // If we have matches, highlight the first one
     if (!g_appWindows.empty()) {
         g_highlightIndex = 0;
+    } else if (!g_minimizedWindows.empty()) {
+        g_highlightIndex = 0;  // will point into minimized range (0 normal + i)
     } else {
         g_highlightIndex = -1;
     }
 }
 
 void CycleHighlight(bool forward) {
-    if (g_appWindows.empty()) {
+    if (g_appWindows.empty() && g_minimizedWindows.empty()) {
         EnumerateAppWindows();
     }
-    if (g_appWindows.empty()) return;
+    int total = (int)g_appWindows.size() + (int)g_minimizedWindows.size();
+    if (total == 0) return;
     
     if (forward) {
         g_highlightIndex++;
-        if (g_highlightIndex >= (int)g_appWindows.size()) {
+        if (g_highlightIndex >= total) {
             g_highlightIndex = 0;
         }
     } else {
         g_highlightIndex--;
         if (g_highlightIndex < 0) {
-            g_highlightIndex = (int)g_appWindows.size() - 1;
+            g_highlightIndex = total - 1;
         }
     }
     
     // Make black background transparent via color key so red highlights stay vivid
-    SetLayeredWindowAttributes(g_hOverlayWnd, COLOR_BLACK, 0, LWA_COLORKEY);
+    SetLayeredWindowAttributes(g_hOverlayWnd, g_palette.background, 0, LWA_COLORKEY);
     
     // Reset the tab-to-text timer on each TAB press
     g_bTabTextMode = false;
@@ -1050,6 +1289,8 @@ void HideGrid() {
     g_typedChars.clear();
     g_appWindows.clear();
     g_allAppWindows.clear();
+    g_minimizedWindows.clear();
+    g_allMinimizedWindows.clear();
     g_highlightIndex = -1;
     g_tabSearchStr.clear();
     g_bTabTextMode = false;
@@ -1123,6 +1364,7 @@ void MoveMouseByArrowKey(int dx, int dy, int moveAmount) {
     if (!g_bMouseMoveMode) {
         g_bMouseMoveMode = true;
         SetLayeredWindowAttributes(g_hOverlayWnd, 0, MOUSE_MOVE_ALPHA, LWA_ALPHA);
+        SetCursor(LoadCursor(NULL, IDC_ARROW));
     }
 }
 
@@ -1207,6 +1449,662 @@ void RemoveTrayIcon() {
     Shell_NotifyIcon(NIM_DELETE, &g_nid);
 }
 
+// ========================================================================
+// Palette picker window
+// ========================================================================
+
+// DPI-scaled layout for the palette window — all values computed at runtime
+struct PalLayout {
+    int winW, winH;
+    int hueBarX, hueBarY, hueBarW, hueBarH;
+    int markerH;
+    int previewX, previewY, previewW, previewH;
+    int btnW, btnH, btnY, btnOkX, btnCancelX;
+    int fontLabel, fontSmall;   // font sizes (negative = point)
+    float dpiScale;
+};
+
+static PalLayout g_palLayout = {};
+
+static PalLayout ComputePalLayout() {
+    // Get DPI of primary monitor
+    UINT dpiX = DEFAULT_DPI, dpiY = DEFAULT_DPI;
+    HMONITOR hMon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    GetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+    float s = (float)dpiX / 96.0f;
+
+    PalLayout L;
+    L.dpiScale  = s;
+    L.winW      = (int)(620 * s);
+    L.winH      = (int)(560 * s);
+    int pad     = (int)(20 * s);
+
+    L.hueBarX   = pad;
+    L.hueBarY   = pad;
+    L.hueBarW   = L.winW - pad * 2;
+    L.hueBarH   = (int)(36 * s);
+    L.markerH   = (int)(10 * s);
+
+    L.btnH      = (int)(32 * s);
+    L.btnW      = (int)(90 * s);
+    L.btnY      = L.winH - pad - L.btnH;  // bottom area
+    L.btnOkX    = L.winW - pad - L.btnW * 2 - (int)(10 * s);
+    L.btnCancelX = L.winW - pad - L.btnW;
+
+    L.previewX  = pad;
+    L.previewY  = L.hueBarY + L.hueBarH + L.markerH + (int)(16 * s);
+    L.previewW  = L.winW - pad * 2;
+    L.previewH  = L.btnY - L.previewY - (int)(8 * s);
+
+    L.fontLabel = -(int)(14 * s);
+    L.fontSmall = -(int)(11 * s);
+
+    return L;
+}
+
+#define IDC_PAL_OK      2001
+#define IDC_PAL_CANCEL  2002
+
+static bool g_bDraggingHue = false;
+static float g_hueBeforeEdit = 0.0f;   // saved on dialog open for Cancel
+static HWND g_hBtnOk = NULL;
+static HWND g_hBtnCancel = NULL;
+static HBITMAP g_hHueBarBitmap = NULL;  // cached rainbow strip (static, never changes)
+
+// Map x pixel inside the hue bar to hue 0..360
+static float HueBarPixelToHue(int x) {
+    const PalLayout& L = g_palLayout;
+    float t = (float)(x - L.hueBarX) / (float)L.hueBarW;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t * 360.0f;
+}
+
+static int HueToHueBarPixel(float hue) {
+    const PalLayout& L = g_palLayout;
+    return L.hueBarX + (int)(hue / 360.0f * L.hueBarW);
+}
+
+// Apply a new hue: regenerate palette, optionally rebuild grid bitmap, repaint
+void ApplyHue(float hue) {
+    g_baseHue = hue;
+    if (g_baseHue < 0.0f)   g_baseHue = 0.0f;
+    if (g_baseHue > 359.9f) g_baseHue = 359.9f;
+    g_palette = GeneratePalette(g_baseHue);
+    // Defer the expensive grid bitmap rebuild unless we're not dragging
+    if (!g_bDraggingHue) {
+        RenderBaseGridBitmap();
+        if (g_bGridVisible) {
+            InvalidateRect(g_hOverlayWnd, NULL, TRUE);
+        }
+    }
+}
+
+// Build the static hue rainbow bitmap (called once when palette window opens)
+static void BuildHueBarBitmap() {
+    if (g_hHueBarBitmap) { DeleteObject(g_hHueBarBitmap); g_hHueBarBitmap = NULL; }
+    const PalLayout& L = g_palLayout;
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    g_hHueBarBitmap = CreateCompatibleBitmap(hdcScreen, L.hueBarW, L.hueBarH);
+    SelectObject(hdcMem, g_hHueBarBitmap);
+    for (int x = 0; x < L.hueBarW; x++) {
+        float h = (float)x / (float)L.hueBarW * 360.0f;
+        COLORREF c = hsl(h, 0.85f, 0.50f);
+        // SetPixelV for single-pixel columns is faster than brush create/fill/delete
+        for (int y = 0; y < L.hueBarH; y++)
+            SetPixelV(hdcMem, x, y, c);
+    }
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+}
+
+// Draw the horizontal hue rainbow bar (blits cached bitmap + draws marker)
+static void PaintHueBar(HDC hdc) {
+    const PalLayout& L = g_palLayout;
+    // Blit cached rainbow
+    if (g_hHueBarBitmap) {
+        HDC hdcBmp = CreateCompatibleDC(hdc);
+        SelectObject(hdcBmp, g_hHueBarBitmap);
+        BitBlt(hdc, L.hueBarX, L.hueBarY, L.hueBarW, L.hueBarH, hdcBmp, 0, 0, SRCCOPY);
+        DeleteDC(hdcBmp);
+    }
+    // Border
+    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(80, 80, 80));
+    HPEN hOld = (HPEN)SelectObject(hdc, hPen);
+    HBRUSH hNull = (HBRUSH)GetStockObject(NULL_BRUSH);
+    HBRUSH hOldBr = (HBRUSH)SelectObject(hdc, hNull);
+    Rectangle(hdc, L.hueBarX - 1, L.hueBarY - 1,
+              L.hueBarX + L.hueBarW + 1, L.hueBarY + L.hueBarH + 1);
+    SelectObject(hdc, hOldBr);
+    SelectObject(hdc, hOld);
+    DeleteObject(hPen);
+
+    // Marker triangle below bar at current hue
+    int triH = L.markerH;
+    int mx = HueToHueBarPixel(g_baseHue);
+    int triTop = L.hueBarY + L.hueBarH + 2;
+    POINT tri[3] = {
+        { mx, triTop },
+        { mx - triH * 3 / 4, triTop + triH },
+        { mx + triH * 3 / 4, triTop + triH }
+    };
+    HBRUSH hMarker = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN hMarkerPen = CreatePen(PS_SOLID, 1, RGB(40, 40, 40));
+    SelectObject(hdc, hMarker);
+    SelectObject(hdc, hMarkerPen);
+    Polygon(hdc, tri, 3);
+    SelectObject(hdc, hOld);
+    DeleteObject(hMarker);
+    DeleteObject(hMarkerPen);
+}
+
+// Draw a miniature preview of the grid + window highlight using the current palette
+static void PaintPreview(HDC hdc) {
+    const PalLayout& L = g_palLayout;
+    int px = L.previewX, py = L.previewY;
+    int pw = L.previewW, ph = L.previewH;
+    float s = L.dpiScale;
+    const Palette& P = g_palette;
+
+    // Background for the whole preview area
+    HBRUSH hBg = CreateSolidBrush(RGB(20, 20, 20));
+    RECT rcBg = { px, py, px + pw, py + ph };
+    FillRect(hdc, &rcBg, hBg);
+    DeleteObject(hBg);
+
+    // ---- Grid preview (left half) ----
+    int pad = (int)(8 * s);
+    int headerH = (int)(22 * s);
+    int gridX = px + pad, gridY = py + headerH + pad;
+    int gridW = pw / 2 - pad * 2, gridH = ph / 2 - headerH - pad;
+    int cols = 4, rows = 3;
+    int cellW = gridW / cols, cellH = gridH / rows;
+
+    // Background fill
+    HBRUSH hGridBg = CreateSolidBrush(P.background);
+    RECT rcGrid = { gridX, gridY, gridX + cols * cellW, gridY + rows * cellH };
+    FillRect(hdc, &rcGrid, hGridBg);
+    DeleteObject(hGridBg);
+
+    // DPI-scaled fonts (cached – only recreated when layout changes)
+    static HFONT hSmallFont = NULL;
+    static HFONT hTinyFont = NULL;
+    static int sCachedLabelSz = 0, sCachedSmallSz = 0;
+    if (!hSmallFont || sCachedLabelSz != L.fontLabel) {
+        if (hSmallFont) DeleteObject(hSmallFont);
+        hSmallFont = CreateFont(L.fontLabel, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, GRID_FONT_NAME);
+        sCachedLabelSz = L.fontLabel;
+    }
+    if (!hTinyFont || sCachedSmallSz != L.fontSmall) {
+        if (hTinyFont) DeleteObject(hTinyFont);
+        hTinyFont = CreateFont(L.fontSmall, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, GRID_FONT_NAME);
+        sCachedSmallSz = L.fontSmall;
+    }
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hSmallFont);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(200, 200, 200));
+    RECT rcLabel = { gridX, py + pad / 2, gridX + gridW, py + headerH };
+    DrawText(hdc, L"Grid View", -1, &rcLabel, DT_LEFT | DT_SINGLELINE);
+
+    // Checkerboard cells + grid lines
+    HBRUSH hEven = CreateSolidBrush(P.cellBgEven);
+    HBRUSH hOdd  = CreateSolidBrush(P.cellBgOdd);
+    const wchar_t* demoLabels[] = {
+        L"aaa", L"aab", L"aac", L"aad",
+        L"aae", L"aaf", L"aag", L"aah",
+        L"aai", L"aaj", L"aak", L"aal"
+    };
+
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            RECT rc = { gridX + c * cellW, gridY + r * cellH,
+                        gridX + (c + 1) * cellW, gridY + (r + 1) * cellH };
+            FillRect(hdc, &rc, ((r + c) % 2 == 0) ? hEven : hOdd);
+
+            // Grid line border
+            HPEN hPen = CreatePen(PS_SOLID, 1, P.gridLine);
+            HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+            HBRUSH hNullBr = (HBRUSH)GetStockObject(NULL_BRUSH);
+            HBRUSH hOldBr2 = (HBRUSH)SelectObject(hdc, hNullBr);
+            Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+            SelectObject(hdc, hOldBr2);
+            SelectObject(hdc, hOldPen);
+            DeleteObject(hPen);
+
+            // Sub-grid lines
+            int sw = cellW / 3, sh = cellH / 3;
+            HPEN hSub = CreatePen(PS_SOLID, 1, P.subGridLine);
+            SelectObject(hdc, hSub);
+            MoveToEx(hdc, rc.left + sw, rc.top, NULL); LineTo(hdc, rc.left + sw, rc.bottom);
+            MoveToEx(hdc, rc.left + sw * 2, rc.top, NULL); LineTo(hdc, rc.left + sw * 2, rc.bottom);
+            MoveToEx(hdc, rc.left, rc.top + sh, NULL); LineTo(hdc, rc.right, rc.top + sh);
+            MoveToEx(hdc, rc.left, rc.top + sh * 2, NULL); LineTo(hdc, rc.right, rc.top + sh * 2);
+            SelectObject(hdc, (HPEN)GetStockObject(BLACK_PEN));
+            DeleteObject(hSub);
+
+            // Cell label
+            SelectObject(hdc, hTinyFont);
+            int idx = r * cols + c;
+            SetTextColor(hdc, P.mainLabelText);
+            DrawText(hdc, demoLabels[idx], -1, &rc, DT_CENTERED);
+
+            // Sub-labels
+            const wchar_t* subs = L"abcdefgh";
+            int si = 0;
+            for (int sy = 0; sy < 3; sy++) {
+                for (int sx = 0; sx < 3; sx++) {
+                    if (sx == 1 && sy == 1) continue;
+                    RECT sr = { rc.left + sx * sw, rc.top + sy * sh,
+                                rc.left + (sx + 1) * sw, rc.top + (sy + 1) * sh };
+                    SetTextColor(hdc, P.subLabelText);
+                    wchar_t sl[2] = { subs[si], 0 };
+                    DrawText(hdc, sl, 1, &sr, DT_CENTERED);
+                    si++;
+                }
+            }
+        }
+    }
+    DeleteObject(hEven);
+    DeleteObject(hOdd);
+
+    // ---- Typing preview (right half) - show match/partial/dim ----
+    int typX = px + pw / 2 + pad, typY = py + headerH + pad;
+    int typW = pw / 2 - pad * 2, typH = ph / 2 - headerH - pad;
+    int tCols = 3, tRows = 3;
+    int tCellW = typW / tCols, tCellH = typH / tRows;
+
+    // Label
+    SelectObject(hdc, hSmallFont);
+    SetTextColor(hdc, RGB(200, 200, 200));
+    RECT rcTypLabel = { typX, py + pad / 2, typX + typW, py + headerH };
+    DrawText(hdc, L"Typing Match", -1, &rcTypLabel, DT_LEFT | DT_SINGLELINE);
+
+    // Simulate: cell [1,1] = full match, [0,x] = partial, rest = dim
+    for (int r = 0; r < tRows; r++) {
+        for (int c = 0; c < tCols; c++) {
+            RECT rc = { typX + c * tCellW, typY + r * tCellH,
+                        typX + (c + 1) * tCellW, typY + (r + 1) * tCellH };
+            bool isMatch = (r == 1 && c == 1);
+            bool isPartial = (r == 0);
+
+            COLORREF bg, fg;
+            if (isMatch) {
+                bg = P.matchCellBg; fg = P.matchLabelText;
+            } else if (isPartial) {
+                bg = P.partialMatchBg; fg = P.partialMatchText;
+            } else {
+                bg = P.dimBg; fg = P.dimText;
+            }
+
+            HBRUSH hCellBg = CreateSolidBrush(bg);
+            FillRect(hdc, &rc, hCellBg);
+            DeleteObject(hCellBg);
+
+            // Grid lines
+            HPEN hPen = CreatePen(PS_SOLID, 1, isMatch ? P.matchGridLine : P.gridLine);
+            HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+            HBRUSH hNullBr = (HBRUSH)GetStockObject(NULL_BRUSH);
+            SelectObject(hdc, hNullBr);
+            Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+            SelectObject(hdc, hOldPen);
+            DeleteObject(hPen);
+
+            // Label
+            SelectObject(hdc, hTinyFont);
+            SetTextColor(hdc, fg);
+            const wchar_t* cellLabel = isMatch ? L"aaf" : (isPartial ? L"aab" : L"abz");
+            DrawText(hdc, cellLabel, -1, &rc, DT_CENTERED);
+
+            // On the matched cell, draw sub-labels + one highlighted
+            if (isMatch) {
+                int sw2 = tCellW / 3, sh2 = tCellH / 3;
+                HPEN hSub = CreatePen(PS_SOLID, 1, P.matchGridLine);
+                SelectObject(hdc, hSub);
+                MoveToEx(hdc, rc.left + sw2, rc.top, NULL); LineTo(hdc, rc.left + sw2, rc.bottom);
+                MoveToEx(hdc, rc.left + sw2 * 2, rc.top, NULL); LineTo(hdc, rc.left + sw2 * 2, rc.bottom);
+                MoveToEx(hdc, rc.left, rc.top + sh2, NULL); LineTo(hdc, rc.right, rc.top + sh2);
+                MoveToEx(hdc, rc.left, rc.top + sh2 * 2, NULL); LineTo(hdc, rc.right, rc.top + sh2 * 2);
+                SelectObject(hdc, (HPEN)GetStockObject(BLACK_PEN));
+                DeleteObject(hSub);
+
+                int si = 0;
+                for (int sy = 0; sy < 3; sy++) {
+                    for (int sx = 0; sx < 3; sx++) {
+                        if (sx == 1 && sy == 1) continue;
+                        RECT sr = { rc.left + sx * sw2, rc.top + sy * sh2,
+                                    rc.left + (sx + 1) * sw2, rc.top + (sy + 1) * sh2 };
+                        if (si == 3) {
+                            HBRUSH hHl = CreateSolidBrush(P.matchSubHighlightBg);
+                            FillRect(hdc, &sr, hHl);
+                            DeleteObject(hHl);
+                            SetTextColor(hdc, P.matchSubHighlightText);
+                        } else {
+                            SetTextColor(hdc, P.matchSubLabelText);
+                        }
+                        wchar_t sl[2] = { L"abcdefgh"[si], 0 };
+                        DrawText(hdc, sl, 1, &sr, DT_CENTERED);
+                        si++;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Window highlight preview (bottom half) ----
+    int winY = py + ph / 2 + headerH + pad;
+    int winH = ph / 2 - headerH - pad * 2;
+    int winW = pw - pad * 2;
+    int winX = px + pad;
+
+    SelectObject(hdc, hSmallFont);
+    SetTextColor(hdc, RGB(200, 200, 200));
+    RECT rcWinLabel = { winX, py + ph / 2 + pad / 2, winX + winW, py + ph / 2 + headerH };
+    DrawText(hdc, L"Window Highlight (TAB mode)", -1, &rcWinLabel, DT_LEFT | DT_SINGLELINE);
+
+    // Dark background
+    HBRUSH hWinBg = CreateSolidBrush(P.background);
+    RECT rcWin = { winX, winY, winX + winW, winY + winH };
+    FillRect(hdc, &rcWin, hWinBg);
+    DeleteObject(hWinBg);
+
+    // Fake windows
+    struct FakeWin { RECT r; const wchar_t* title; bool current; };
+    int fw1 = winW * 55 / 100, fh1 = winH * 70 / 100;
+    int fw2 = winW * 45 / 100, fh2 = winH * 60 / 100;
+    FakeWin fakes[] = {
+        { { winX + (int)(10*s), winY + (int)(24*s), winX + (int)(10*s) + fw1, winY + (int)(24*s) + fh1 }, L"[1/2] Visual Studio Code", true },
+        { { winX + winW - fw2 - (int)(10*s), winY + (int)(12*s), winX + winW - (int)(10*s), winY + (int)(12*s) + fh2 }, L"[2/2] Firefox", false }
+    };
+
+    int thick = max(2, (int)(3 * s));
+    for (const auto& fw : fakes) {
+        COLORREF borderCol = fw.current ? P.mainLabelText : P.gridLine;
+        HBRUSH hBorder = CreateSolidBrush(borderCol);
+
+        RECT e;
+        e = { fw.r.left, fw.r.top, fw.r.right, fw.r.top + thick };
+        FillRect(hdc, &e, hBorder);
+        e = { fw.r.left, fw.r.bottom - thick, fw.r.right, fw.r.bottom };
+        FillRect(hdc, &e, hBorder);
+        e = { fw.r.left, fw.r.top, fw.r.left + thick, fw.r.bottom };
+        FillRect(hdc, &e, hBorder);
+        e = { fw.r.right - thick, fw.r.top, fw.r.right, fw.r.bottom };
+        FillRect(hdc, &e, hBorder);
+        DeleteObject(hBorder);
+
+        // Label above the window
+        SIZE ts;
+        GetTextExtentPoint32(hdc, fw.title, (int)wcslen(fw.title), &ts);
+        RECT lblBg = { fw.r.left, fw.r.top - ts.cy - (int)(6*s),
+                       fw.r.left + ts.cx + (int)(8*s), fw.r.top - 2 };
+        HBRUSH hLbl = CreateSolidBrush(fw.current ? P.matchCellBg : P.cellBgEven);
+        FillRect(hdc, &lblBg, hLbl);
+        DeleteObject(hLbl);
+
+        SelectObject(hdc, hTinyFont);
+        SetTextColor(hdc, P.matchLabelText);
+        RECT lblRc = { lblBg.left + (int)(4*s), lblBg.top + (int)(2*s), lblBg.right, lblBg.bottom };
+        DrawText(hdc, fw.title, -1, &lblRc, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    // Minimized panel preview
+    int mpW = winW / 3, mpH = winH - (int)(10*s);
+    int mpX = winX + winW - mpW - (int)(4*s), mpY = winY + (int)(4*s);
+    RECT rcPanel = { mpX, mpY, mpX + mpW, mpY + mpH };
+    HBRUSH hPanelBg = CreateSolidBrush(P.background);
+    FillRect(hdc, &rcPanel, hPanelBg);
+    DeleteObject(hPanelBg);
+
+    // Panel border
+    HBRUSH hPanelBorder = CreateSolidBrush(P.gridLine);
+    RECT be;
+    be = { rcPanel.left, rcPanel.top, rcPanel.right, rcPanel.top + 1 };
+    FillRect(hdc, &be, hPanelBorder);
+    be = { rcPanel.left, rcPanel.bottom - 1, rcPanel.right, rcPanel.bottom };
+    FillRect(hdc, &be, hPanelBorder);
+    be = { rcPanel.left, rcPanel.top, rcPanel.left + 1, rcPanel.bottom };
+    FillRect(hdc, &be, hPanelBorder);
+    be = { rcPanel.right - 1, rcPanel.top, rcPanel.right, rcPanel.bottom };
+    FillRect(hdc, &be, hPanelBorder);
+    DeleteObject(hPanelBorder);
+
+    // Panel title
+    SetTextColor(hdc, P.mainLabelText);
+    SelectObject(hdc, hTinyFont);
+    int itemH = (int)(18 * s);
+    RECT rcPanelTitle = { mpX + (int)(4*s), mpY + (int)(3*s), mpX + mpW - (int)(4*s), mpY + itemH };
+    DrawText(hdc, L"Minimized", -1, &rcPanelTitle, DT_LEFT | DT_SINGLELINE);
+
+    // Panel items
+    const wchar_t* items[] = { L"Notepad", L"Calculator", L"Slack" };
+    int itemTop = mpY + itemH + (int)(2*s);
+    for (int i = 0; i < 3; i++) {
+        int iy = itemTop + i * itemH;
+        RECT ir = { mpX + (int)(4*s), iy, mpX + mpW - (int)(4*s), iy + itemH };
+        if (i == 0) {
+            RECT hlr = { mpX + 1, iy, mpX + mpW - 1, iy + itemH };
+            HBRUSH hHl = CreateSolidBrush(P.matchSubHighlightBg);
+            FillRect(hdc, &hlr, hHl);
+            DeleteObject(hHl);
+            SetTextColor(hdc, P.matchSubHighlightText);
+        } else {
+            SetTextColor(hdc, P.subLabelText);
+        }
+        DrawText(hdc, items[i], -1, &ir, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    // Hue value label at bottom of preview
+    SelectObject(hdc, hSmallFont);
+    SetTextColor(hdc, RGB(200, 200, 200));
+    wchar_t hueBuf[64];
+    swprintf_s(hueBuf, L"Hue: %.0f\u00b0", g_baseHue);
+    RECT rcHue = { px, py + ph - (int)(22*s), px + pw, py + ph };
+    DrawText(hdc, hueBuf, -1, &rcHue, DT_CENTER | DT_SINGLELINE);
+
+    // Cleanup (fonts are cached statics, don't delete here)
+    SelectObject(hdc, hOldFont);
+}
+
+// --- Registry persistence for user settings ---
+static const wchar_t* REG_KEY = L"Software\\KeyboardJockey";
+
+static void SaveHueToRegistry(float hue) {
+    HKEY hKey;
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, NULL,
+            REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        DWORD val = (DWORD)(hue * 100.0f);  // store as fixed-point (2 decimals)
+        RegSetValueEx(hKey, L"BaseHue", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hKey);
+    }
+}
+
+static float LoadHueFromRegistry() {
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD val = 0, sz = sizeof(val), type = 0;
+        if (RegQueryValueEx(hKey, L"BaseHue", NULL, &type, (BYTE*)&val, &sz) == ERROR_SUCCESS
+            && type == REG_DWORD) {
+            RegCloseKey(hKey);
+            float h = (float)val / 100.0f;
+            if (h >= 0.0f && h < 360.0f) return h;
+        } else {
+            RegCloseKey(hKey);
+        }
+    }
+    return BASE_HUE_DEFAULT;  // no saved value
+}
+
+// Palette window procedure
+LRESULT CALLBACK PaletteWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        const PalLayout& L = g_palLayout;
+        // Create OK and Cancel buttons
+        HFONT hBtnFont = CreateFont(L.fontLabel, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, GRID_FONT_NAME);
+        g_hBtnOk = CreateWindowEx(0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            L.btnOkX, L.btnY, L.btnW, L.btnH,
+            hWnd, (HMENU)IDC_PAL_OK, g_hInstance, NULL);
+        g_hBtnCancel = CreateWindowEx(0, L"BUTTON", L"Cancel",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            L.btnCancelX, L.btnY, L.btnW, L.btnH,
+            hWnd, (HMENU)IDC_PAL_CANCEL, g_hInstance, NULL);
+        SendMessage(g_hBtnOk, WM_SETFONT, (WPARAM)hBtnFont, TRUE);
+        SendMessage(g_hBtnCancel, WM_SETFONT, (WPARAM)hBtnFont, TRUE);
+        // hBtnFont intentionally not deleted — owned by the buttons for their lifetime
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        // Double-buffer
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+        int w = rc.right, h = rc.bottom;
+        HDC hdcMem = CreateCompatibleDC(hdc);
+        HBITMAP hbm = CreateCompatibleBitmap(hdc, w, h);
+        HBITMAP hOldBm = (HBITMAP)SelectObject(hdcMem, hbm);
+
+        // Fill with dark gray
+        HBRUSH hBg = CreateSolidBrush(RGB(30, 30, 30));
+        FillRect(hdcMem, &rc, hBg);
+        DeleteObject(hBg);
+
+        PaintHueBar(hdcMem);
+        PaintPreview(hdcMem);
+
+        BitBlt(hdc, 0, 0, w, h, hdcMem, 0, 0, SRCCOPY);
+        SelectObject(hdcMem, hOldBm);
+        DeleteObject(hbm);
+        DeleteDC(hdcMem);
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        const PalLayout& L = g_palLayout;
+        int mx = LOWORD(lParam), my = HIWORD(lParam);
+        if (mx >= L.hueBarX && mx <= L.hueBarX + L.hueBarW &&
+            my >= L.hueBarY - (int)(4*L.dpiScale) &&
+            my <= L.hueBarY + L.hueBarH + L.markerH + (int)(8*L.dpiScale)) {
+            g_bDraggingHue = true;
+            SetCapture(hWnd);
+            float newHue = HueBarPixelToHue(mx);
+            ApplyHue(newHue);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        if (g_bDraggingHue) {
+            int mx = (short)LOWORD(lParam);
+            float newHue = HueBarPixelToHue(mx);
+            ApplyHue(newHue);
+            InvalidateRect(hWnd, NULL, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP:
+        if (g_bDraggingHue) {
+            g_bDraggingHue = false;
+            ReleaseCapture();
+            // Now do the deferred expensive rebuild
+            RenderBaseGridBitmap();
+            if (g_bGridVisible) {
+                InvalidateRect(g_hOverlayWnd, NULL, TRUE);
+            }
+        }
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_PAL_OK:
+            // Accept — save to registry and close
+            SaveHueToRegistry(g_baseHue);
+            DestroyWindow(hWnd);
+            break;
+        case IDC_PAL_CANCEL:
+            // Revert to the hue we had when the dialog opened
+            ApplyHue(g_hueBeforeEdit);
+            DestroyWindow(hWnd);
+            break;
+        }
+        return 0;
+
+    case WM_CLOSE:
+        // Closing via X button = Cancel
+        ApplyHue(g_hueBeforeEdit);
+        DestroyWindow(hWnd);
+        return 0;
+
+    case WM_DESTROY:
+        g_hBtnOk = NULL;
+        g_hBtnCancel = NULL;
+        g_hPaletteWnd = NULL;
+        if (g_hHueBarBitmap) { DeleteObject(g_hHueBarBitmap); g_hHueBarBitmap = NULL; }
+        return 0;
+
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+void ShowPaletteWindow() {
+    // If already open, bring to front
+    if (g_hPaletteWnd && IsWindow(g_hPaletteWnd)) {
+        SetForegroundWindow(g_hPaletteWnd);
+        return;
+    }
+
+    // Save current hue for Cancel
+    g_hueBeforeEdit = g_baseHue;
+
+    // Compute DPI-aware layout
+    g_palLayout = ComputePalLayout();
+    const PalLayout& L = g_palLayout;
+
+    // Build cached hue bar bitmap
+    BuildHueBarBitmap();
+
+    // Compute outer window size from desired client area
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT rcDesired = { 0, 0, L.winW, L.winH };
+    AdjustWindowRectEx(&rcDesired, style, FALSE, WS_EX_APPWINDOW);
+    int outerW = rcDesired.right - rcDesired.left;
+    int outerH = rcDesired.bottom - rcDesired.top;
+
+    // Center on primary monitor
+    int sx = GetSystemMetrics(SM_CXSCREEN);
+    int sy = GetSystemMetrics(SM_CYSCREEN);
+    int wx = (sx - outerW) / 2;
+    int wy = (sy - outerH) / 2;
+
+    g_hPaletteWnd = CreateWindowEx(
+        WS_EX_APPWINDOW,
+        L"KeyboardJockeyPalette",
+        L"Keyboard Jockey \u2013 Palette",
+        style,
+        wx, wy, outerW, outerH,
+        NULL, NULL, g_hInstance, NULL
+    );
+
+    ShowWindow(g_hPaletteWnd, SW_SHOW);
+    UpdateWindow(g_hPaletteWnd);
+}
+
 // Show context menu
 void ShowContextMenu(HWND hWnd) {
     POINT pt;
@@ -1214,6 +2112,7 @@ void ShowContextMenu(HWND hWnd) {
     
     HMENU hMenu = CreatePopupMenu();
     AppendMenu(hMenu, MF_STRING, IDM_SHOW, L"Show Grid (Ctrl+Alt+M)");
+    AppendMenu(hMenu, MF_STRING, IDM_PALETTE, L"Palette...");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, IDM_EXIT, L"Exit");
     
@@ -1227,6 +2126,14 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
     switch (message) {
     case WM_ERASEBKGND:
         return 1;  // Skip erase — we paint the full surface ourselves
+    
+    case WM_SETCURSOR:
+        // Show normal arrow cursor during mouse-move and scroll modes instead of cross
+        if (g_bMouseMoveMode || g_bScrollMode) {
+            SetCursor(LoadCursor(NULL, IDC_ARROW));
+            return TRUE;
+        }
+        return DefWindowProc(hWnd, message, wParam, lParam);
     
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -1267,10 +2174,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             case VK_ESCAPE:
                 HideGrid();
                 return 0;
-            case VK_RETURN:
+            case VK_RETURN: {
                 // Activate highlighted window (or single search match)
-                if (g_highlightIndex >= 0 && g_highlightIndex < (int)g_appWindows.size()) {
-                    HWND targetWnd = g_appWindows[g_highlightIndex].hwnd;
+                int totalNormal = (int)g_appWindows.size();
+                HWND targetWnd = NULL;
+                if (g_highlightIndex >= 0 && g_highlightIndex < totalNormal) {
+                    targetWnd = g_appWindows[g_highlightIndex].hwnd;
+                } else if (g_highlightIndex >= totalNormal && (g_highlightIndex - totalNormal) < (int)g_minimizedWindows.size()) {
+                    targetWnd = g_minimizedWindows[g_highlightIndex - totalNormal].hwnd;
+                }
+                if (targetWnd) {
                     HideGrid();
                     Sleep(ACTIVATION_DELAY_MS);
                     SetForegroundWindow(targetWnd);
@@ -1278,10 +2191,29 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                         ShowWindow(targetWnd, SW_RESTORE);
                     }
                 }
+                }
                 return 0;
             case VK_TAB: {
-                bool shiftTab = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                CycleHighlight(!shiftTab);
+                // If in text search mode, TAB exits back to normal cycling
+                if (g_bTabTextMode || !g_tabSearchStr.empty()) {
+                    g_bTabTextMode = false;
+                    g_tabSearchStr.clear();
+                    // Restore to visible-only windows for normal cycling
+                    g_appWindows.clear();
+                    for (const auto& aw : g_allAppWindows) {
+                        if (aw.visibleArea > 0) g_appWindows.push_back(aw);
+                    }
+                    g_minimizedWindows.clear();  // hide minimized panel
+                    if (!g_appWindows.empty()) g_highlightIndex = 0;
+                    else g_highlightIndex = -1;
+                    SetLayeredWindowAttributes(g_hOverlayWnd, g_palette.background, 0, LWA_COLORKEY);
+                    KillTimer(hWnd, TIMER_ID_TAB_TEXT);
+                    SetTimer(hWnd, TIMER_ID_TAB_TEXT, TAB_TEXT_TIMEOUT_MS, NULL);
+                    InvalidateRect(hWnd, NULL, TRUE);
+                } else {
+                    bool shiftTab = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                    CycleHighlight(!shiftTab);
+                }
                 return 0;
             }
             case VK_BACK:
@@ -1296,7 +2228,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                                 if (aw.visibleArea > 0) g_appWindows.push_back(aw);
                             }
                         }
+                        g_minimizedWindows = g_allMinimizedWindows;
                         if (!g_appWindows.empty()) g_highlightIndex = 0;
+                        else if (!g_minimizedWindows.empty()) g_highlightIndex = 0;
                         else g_highlightIndex = -1;
                     } else {
                         FilterAppWindowsBySearch();
@@ -1334,7 +2268,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         case VK_SHIFT:
             // Make UI subtle when Shift is pressed (skip in highlight mode)
             if (g_highlightIndex < 0) {
-                SetLayeredWindowAttributes(g_hOverlayWnd, 0, MOUSE_MOVE_ALPHA, LWA_ALPHA);
+                BYTE peekAlpha = g_bMouseMoveMode ? MOUSE_MOVE_ALPHA : SHIFT_PEEK_ALPHA;
+                SetLayeredWindowAttributes(g_hOverlayWnd, 0, peekAlpha, LWA_ALPHA);
             }
             break;
         case VK_SPACE: {
@@ -1345,15 +2280,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         }
         case VK_RETURN: {
             // If in window highlight mode, activate the highlighted window
-            if (g_highlightIndex >= 0 && g_highlightIndex < (int)g_appWindows.size()) {
-                HWND targetWnd = g_appWindows[g_highlightIndex].hwnd;
+            HWND targetWnd2 = NULL;
+            int totalNormal2 = (int)g_appWindows.size();
+            if (g_highlightIndex >= 0 && g_highlightIndex < totalNormal2) {
+                targetWnd2 = g_appWindows[g_highlightIndex].hwnd;
+            } else if (g_highlightIndex >= totalNormal2 && (g_highlightIndex - totalNormal2) < (int)g_minimizedWindows.size()) {
+                targetWnd2 = g_minimizedWindows[g_highlightIndex - totalNormal2].hwnd;
+            }
+            if (targetWnd2) {
                 HideGrid();
                 Sleep(ACTIVATION_DELAY_MS);
                 // Activate the window
-                SetForegroundWindow(targetWnd);
+                SetForegroundWindow(targetWnd2);
                 // If minimized, restore it
-                if (IsIconic(targetWnd)) {
-                    ShowWindow(targetWnd, SW_RESTORE);
+                if (IsIconic(targetWnd2)) {
+                    ShowWindow(targetWnd2, SW_RESTORE);
                 }
                 break;
             }
@@ -1391,7 +2332,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                     for (const auto& aw : g_allAppWindows) {
                         if (aw.visibleArea > 0) g_appWindows.push_back(aw);
                     }
+                    g_minimizedWindows = g_allMinimizedWindows;
                     if (!g_appWindows.empty()) g_highlightIndex = 0;
+                    else if (!g_minimizedWindows.empty()) g_highlightIndex = 0;
                     else g_highlightIndex = -1;
                 } else {
                     FilterAppWindowsBySearch();
@@ -1404,16 +2347,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             break;
         case VK_PRIOR:   // PgUp
         case VK_NEXT: {  // PgDn
-            // Enter scroll mode: make overlay invisible, send key to window under cursor
+            // Enter scroll mode: make overlay invisible, send wheel to window under cursor
             if (!g_bScrollMode) {
                 g_bScrollMode = true;
-                // Make overlay fully transparent but keep it for focus
-                SetLayeredWindowAttributes(g_hOverlayWnd, COLOR_BLACK, 0, LWA_COLORKEY);
+                // Make overlay visually transparent via color key
+                SetLayeredWindowAttributes(g_hOverlayWnd, g_palette.background, 0, LWA_COLORKEY);
                 InvalidateRect(g_hOverlayWnd, NULL, TRUE);
+                UpdateWindow(g_hOverlayWnd);
+                SetCursor(LoadCursor(NULL, IDC_ARROW));
+                // Make overlay transparent to ALL input (mouse clicks, wheel, etc.)
+                LONG_PTR exStyle = GetWindowLongPtr(g_hOverlayWnd, GWL_EXSTYLE);
+                SetWindowLongPtr(g_hOverlayWnd, GWL_EXSTYLE, exStyle | WS_EX_TRANSPARENT);
                 // Install mouse hook to detect movement
                 g_hScrollMouseHook = SetWindowsHookEx(WH_MOUSE_LL, ScrollMouseProc, g_hInstance, 0);
             }
-            // Simulate mouse wheel scroll (page-sized: 3 * WHEEL_DELTA)
+            // Simulate mouse wheel scroll (passes through to window under cursor)
             {
                 INPUT input = {};
                 input.type = INPUT_MOUSE;
@@ -1440,8 +2388,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             g_tabSearchStr.clear();
             KillTimer(hWnd, TIMER_ID_TAB_TEXT);
             g_appWindows = g_allAppWindows;
+            g_minimizedWindows = g_allMinimizedWindows;
             if (!g_appWindows.empty()) g_highlightIndex = 0;
-            SetLayeredWindowAttributes(g_hOverlayWnd, COLOR_BLACK, 0, LWA_COLORKEY);
+            else if (!g_minimizedWindows.empty()) g_highlightIndex = 0;
+            // Combine color-key + alpha: background pixels = invisible, panel = semi-transparent
+            SetLayeredWindowAttributes(g_hOverlayWnd, g_palette.background, GRID_ALPHA, LWA_COLORKEY | LWA_ALPHA);
             InvalidateRect(hWnd, NULL, TRUE);
             return 0;
         }
@@ -1494,7 +2445,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                         if (aw.visibleArea > 0) g_appWindows.push_back(aw);
                     }
                 }
+                g_minimizedWindows = g_allMinimizedWindows;
                 if (!g_appWindows.empty()) g_highlightIndex = 0;
+                else if (!g_minimizedWindows.empty()) g_highlightIndex = 0;
                 else g_highlightIndex = -1;
                 InvalidateRect(hWnd, NULL, TRUE);
             } else if (!g_typedChars.empty()) {
@@ -1510,7 +2463,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                 g_tabSearchStr.clear();
                 // Switch to all windows (including fully occluded)
                 g_appWindows = g_allAppWindows;
+                g_minimizedWindows = g_allMinimizedWindows;
                 if (!g_appWindows.empty()) g_highlightIndex = 0;
+                else if (!g_minimizedWindows.empty()) g_highlightIndex = 0;
+                // Combine color-key + alpha: background pixels = invisible, panel = semi-transparent
+                SetLayeredWindowAttributes(g_hOverlayWnd, g_palette.background, GRID_ALPHA, LWA_COLORKEY | LWA_ALPHA);
                 InvalidateRect(hWnd, NULL, TRUE);
             }
         }
@@ -1566,6 +2523,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         case IDM_SHOW:
             ShowGrid();
             break;
+        case IDM_PALETTE:
+            ShowPaletteWindow();
+            break;
         }
         return 0;
     
@@ -1592,6 +2552,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     
     g_hInstance = hInstance;
+
+    // Load saved hue from registry and apply it
+    g_baseHue = LoadHueFromRegistry();
+    g_palette = GeneratePalette(g_baseHue);
     
     // Save a copy of the default arrow cursor before we ever modify system cursors
     HCURSOR hArrow = LoadCursor(NULL, IDC_ARROW);
@@ -1632,6 +2596,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         MessageBox(NULL, L"Failed to register overlay window class", L"Error", MB_ICONERROR);
         return 1;
     }
+    
+    // Register palette picker window class
+    WNDCLASSEX wcPalette = {};
+    wcPalette.cbSize = sizeof(WNDCLASSEX);
+    wcPalette.lpfnWndProc = PaletteWndProc;
+    wcPalette.hInstance = hInstance;
+    wcPalette.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcPalette.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wcPalette.lpszClassName = L"KeyboardJockeyPalette";
+    wcPalette.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_KEYBOARDJOCKEY));
+    wcPalette.hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_KEYBOARDJOCKEY));
+    RegisterClassEx(&wcPalette);
     
     // Create main window (hidden)
     g_hMainWnd = CreateWindowEx(

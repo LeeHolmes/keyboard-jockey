@@ -6,6 +6,14 @@ A keyboard-driven mouse navigation and window management utility for Windows. Ke
 
 Launch `KeyboardJockey.exe`. It minimizes to the system tray immediately. Press **Ctrl+Alt+M** to activate the grid overlay. Right-click the tray icon for options or to exit.
 
+### Tray Menu
+
+Right-click the tray icon for:
+
+- **Show Grid (Ctrl+Alt+M)** — Toggle the overlay grid
+- **Palette…** — Open the colour palette picker (see below)
+- **Exit** — Quit Keyboard Jockey
+
 ## Features
 
 ### Grid Navigation
@@ -14,7 +22,9 @@ Press **Ctrl+Alt+M** to show a full-screen overlay grid. Each cell is labeled wi
 
 If you need further accuracy, each cell also contains a 3×3 sub-grid labeled **a–h** (around the center). After typing a cell code, type one more letter to move the mouse to a specific sub-position within that cell.
 
-If the content is too obscured by the grid, hold down **Shift** to make your desktop more visible.
+The grid uses a **checkerboard pattern** — alternating cells are tinted with the base colour and a 90° accent offset — making it easy to visually distinguish adjacent cells.
+
+If the content is too obscured by the grid, hold down **Shift** to fade the overlay to 80% transparent so you can see your desktop.
 
 ### Arrow Key Fine-Tuning
 
@@ -28,7 +38,7 @@ The grid fades to semi-transparent during arrow key movement so you can see what
 
 ### Window Switching (TAB Mode)
 
-Press **Tab** while the grid is showing to cycle through open application windows. Each window is highlighted with a red border and a title label showing its position in the list. Unlike traditional Windows Alt+Tab behaviour (which cycles through by order of last use), windows are sorted by visible area (most visible first).
+Press **Tab** while the grid is showing to cycle through open application windows. Each window is highlighted with a coloured border and a title label showing its position in the list. Unlike traditional Windows Alt+Tab behaviour (which cycles through by order of last use), windows are sorted by visible area (most visible first).
 
 - **Tab**: Next window
 - **Shift+Tab**: Previous window
@@ -39,12 +49,21 @@ Press **Tab** while the grid is showing to cycle through open application window
 
 After pressing Tab, you can search for windows by typing part of their title:
 
-- After a brief pause in TAB mode, or by pressing **\***, all windows (including fully occluded ones) are shown with red highlight boxes
+- After a brief pause in TAB mode, or by pressing **\***, all windows (including fully occluded ones) are shown with highlight boxes
 - Start **typing** to filter windows by substring match (case-insensitive). For example, typing "out" would match "Outlook", "About", etc.
 - **Enter** activates the highlighted window. If your search narrows to a single match, Enter focuses it immediately
 - **Backspace** removes the last character from the search
-- The search resets after a brief pause, returning to the all-windows view
+- **Tab** exits text-search mode and returns to normal window cycling
 - **Tab/Shift+Tab** still cycles through the filtered results
+
+In text-search mode, the grid background becomes fully transparent — only the window highlight boxes and the minimized applications panel remain visible (semi-transparent), so the search doesn't obscure your desktop.
+
+### Minimized Applications
+
+When in text-search mode, a **Minimized Applications** panel appears in the bottom-right corner of the primary monitor, listing up to 20 minimized windows. These are filtered by the same type-to-search mechanism as regular windows.
+
+- **Tab/Shift+Tab** cycles through both normal and minimized windows in a single list
+- **Enter** on a minimized window restores and focuses it
 
 ### Cursor Hide & Reveal
 
@@ -60,9 +79,18 @@ Press **Page Up** or **Page Down** while the grid is showing to scroll the conte
 - You can press PgUp/PgDn repeatedly to keep scrolling
 - **Moving the mouse** or **pressing any other key** exits scroll mode and closes the overlay
 
-### Per-Monitor DPI Awareness
+### Colour Palette
 
-Keyboard Jockey is per-monitor DPI aware (V2). On multi-monitor setups with different scaling factors, the overlay, grid coordinates, and window highlight rects all use physical pixel coordinates for accurate alignment. Font sizes and line widths scale proportionally to screen dimensions.
+All UI colours are generated from a **single base hue** using an HSL colour model. The base hue drives the grid cells, highlight boxes, search match colours, text labels, and the minimized panel — producing a cohesive theme from one number. A 90° accent-hue offset is used for alternating checkerboard cells, partial-match highlights, and sub-labels.
+
+Open **Palette…** from the tray menu to adjust the hue:
+
+- A **hue bar** (0–360°) lets you drag to preview any colour in real time
+- A **live preview** below the bar shows how the grid, text matching, and window highlights will look
+- **OK** accepts the new colour and saves it to the Windows registry so it persists across restarts
+- **Cancel** (or closing the window) reverts to the previous colour
+
+The default hue is 30° (warm amber/woodsy tones).
 
 ## Building
 
@@ -85,6 +113,7 @@ The output is `x64\Release\KeyboardJockey.exe`.
 | **Arrow keys** | Grid mode | Nudge mouse (10px) |
 | **Shift+Arrow** | Grid mode | Nudge mouse (1px) |
 | **Ctrl+Arrow** | Grid mode | Nudge mouse (50px) |
+| **Shift** | Grid mode | Peek through overlay (80% transparent) |
 | **Space** | Grid mode | Hide cursor and close grid |
 | **Tab** | Grid mode | Enter window cycling mode |
 | **Shift+Tab** | TAB mode | Previous window |
@@ -92,5 +121,6 @@ The output is `x64\Release\KeyboardJockey.exe`.
 | **a–z** | TAB mode | Filter windows by title substring |
 | **\*** | TAB mode | Show all windows (including hidden) |
 | **Backspace** | TAB mode | Delete last search character |
+| **Tab** | Text-search mode | Return to normal TAB cycling |
 | **PgUp/PgDn** | Grid mode | Scroll content under cursor |
 | **Escape** | Any mode | Close overlay |
