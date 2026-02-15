@@ -20,7 +20,7 @@ Right-click the tray icon for:
 
 <img width="1913" height="1129" alt="image" src="https://github.com/user-attachments/assets/beb9e7cd-05cd-476d-a7d6-33c78f2cdc2e" />
 
-Press **Ctrl+Alt+M** to show a full-screen overlay grid. Each cell is labeled with a short letter code. Type the letters to move the mouse to that cell, then press **Enter** to click. Hold **Ctrl+Enter** for a right-click.
+Press **Ctrl+Alt+M** to show a full-screen overlay grid. Each cell is labeled with a short letter code. Type the letters to move the mouse to that cell, then press **Enter** to click. Hold **Ctrl+Enter** for a double-click, or **Alt+Enter** for a right-click.
 
 If you need further accuracy, each cell also contains a 3×3 sub-grid labeled **a–h** (around the center). After typing a cell code, type one more letter to move the mouse to a specific sub-position within that cell.
 
@@ -115,7 +115,8 @@ The output is `x64\Release\KeyboardJockey.exe`.
 | **Ctrl+Alt+M** | Global | Toggle grid overlay |
 | **a–z** | Grid mode | Type cell label to move mouse |
 | **Enter** | Grid mode | Left-click |
-| **Ctrl+Enter** | Grid mode | Right-click |
+| **Ctrl+Enter** | Grid mode | Double-click |
+| **Alt+Enter** | Grid mode | Right-click |
 | **Arrow keys** | Grid mode | Nudge mouse (10px) |
 | **Shift+Arrow** | Grid mode | Nudge mouse (1px) |
 | **Ctrl+Arrow** | Grid mode | Nudge mouse (50px) |

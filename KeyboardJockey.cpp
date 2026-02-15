@@ -1323,6 +1323,16 @@ void SendClick(bool rightClick) {
     SendInput(2, input, sizeof(INPUT));
 }
 
+void SendDoubleClick() {
+    INPUT input[4] = {};
+    for (int i = 0; i < 4; i++) input[i].type = INPUT_MOUSE;
+    input[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    input[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    input[2].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    input[3].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(4, input, sizeof(INPUT));
+}
+
 // Get sub-grid point index from character a-h
 // Layout: a b c
 //         d X e
@@ -2309,11 +2319,13 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             HideGrid();
             // Small delay to let grid disappear
             Sleep(ACTIVATION_DELAY_MS);
-            // Check if Ctrl is held for right-click
-            if (GetKeyState(VK_CONTROL) & 0x8000) {
-                SendClick(true);  // Right click
+            // Check modifiers: Alt=right-click, Ctrl=double-click
+            if (GetKeyState(VK_MENU) & 0x8000) {
+                SendClick(true);    // Right click
+            } else if (GetKeyState(VK_CONTROL) & 0x8000) {
+                SendDoubleClick();  // Double click
             } else {
-                SendClick(false); // Left click
+                SendClick(false);   // Left click
             }
             break;
         }
