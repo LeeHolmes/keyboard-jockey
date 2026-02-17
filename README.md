@@ -1,6 +1,8 @@
 # Keyboard Jockey
 
-A keyboard-driven mouse navigation and window management utility for Windows. Keyboard Jockey lives in the system tray and provides a full-screen overlay grid that lets you move the mouse, click, switch windows, and scroll — all without touching the mouse.
+<img width="810" height="810" alt="image" src="https://github.com/user-attachments/assets/7009f823-0e77-4cc6-a162-bd5671895607" />
+
+Free yourself from the oppression of using your mouse! Keyboard Jockey lives in the system tray and provides a full-screen overlay grid that lets you move the mouse, click, switch windows, and scroll — all without touching the mouse.
 
 ## Getting Started
 
@@ -133,4 +135,5 @@ The output is `x64\Release\KeyboardJockey.exe`.
 | **Tab** | Text-search mode | Return to normal TAB cycling |
 | **PgUp/PgDn** | Grid mode | Scroll content under cursor |
 | **Escape** | Any mode | Close overlay |
+
 
