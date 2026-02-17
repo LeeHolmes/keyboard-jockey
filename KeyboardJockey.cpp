@@ -2170,7 +2170,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         return 0;
     }
     
-    case WM_KEYDOWN: {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
         // In scroll mode, only PgUp/PgDn/Escape are allowed; anything else exits
         if (g_bScrollMode && wParam != VK_PRIOR && wParam != VK_NEXT && wParam != VK_ESCAPE) {
             ExitScrollMode();
@@ -2316,13 +2317,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                     MoveMouse(it->second);
                 }
             }
+            // Capture modifiers before hiding overlay/focus changes
+            bool altHeld = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            bool ctrlHeldForClick = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             HideGrid();
             // Small delay to let grid disappear
             Sleep(ACTIVATION_DELAY_MS);
             // Check modifiers: Alt=right-click, Ctrl=double-click
-            if (GetKeyState(VK_MENU) & 0x8000) {
+            if (altHeld) {
                 SendClick(true);    // Right click
-            } else if (GetKeyState(VK_CONTROL) & 0x8000) {
+            } else if (ctrlHeldForClick) {
                 SendDoubleClick();  // Double click
             } else {
                 SendClick(false);   // Left click
